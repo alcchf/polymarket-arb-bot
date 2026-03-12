@@ -4,6 +4,9 @@ from collections import defaultdict
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 
+# =========================
+# Telegram
+# =========================
 def send(msg):
     try:
         url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -38,7 +41,7 @@ def markets():
     return all
 
 # =========================
-# ⭐ Partition Arb
+# ⭐ Partition Arb (FIXED)
 # =========================
 def partition(ms):
 
@@ -51,23 +54,30 @@ def partition(ms):
         if not g:continue
 
         try:
-            p=float(m["outcomes"][0]["price"])
             liq=float(m["liquidity"])
         except:continue
 
         if liq<500:continue
 
-        groups[g].append((m,p))
+        # ✅ 只取 YES
+        yes_price=None
+
+        for o in m["outcomes"]:
+            if o["name"].lower()=="yes":
+                yes_price=float(o["price"])
+                break
+
+        if yes_price is None:
+            continue
+
+        groups[g].append((m,yes_price))
 
     for g in groups:
 
         if len(groups[g])<4:
             continue
 
-        sum_yes=0
-
-        for m,p in groups[g]:
-            sum_yes+=p
+        sum_yes=sum([p for _,p in groups[g]])
 
         if sum_yes>1.03:
 
@@ -119,13 +129,22 @@ def mutual(ms):
         if not g:continue
 
         try:
-            p=float(m["outcomes"][0]["price"])
             liq=float(m["liquidity"])
         except:continue
 
         if liq<20000:continue
 
-        groups[g].append((m,p))
+        yes_price=None
+
+        for o in m["outcomes"]:
+            if o["name"].lower()=="yes":
+                yes_price=float(o["price"])
+                break
+
+        if yes_price is None:
+            continue
+
+        groups[g].append((m,yes_price))
 
     for g in groups:
         if len(groups[g])<3:continue
@@ -164,14 +183,23 @@ def nomination(ms):
         q=m.get("question","").lower()
 
         try:
-            p=float(m["outcomes"][0]["price"])
             liq=float(m["liquidity"])
         except:continue
 
         if liq<20000:continue
 
-        if "president" in q: pres.append((m,p))
-        if "nomination" in q or "primary" in q: nom.append((m,p))
+        yes_price=None
+
+        for o in m["outcomes"]:
+            if o["name"].lower()=="yes":
+                yes_price=float(o["price"])
+                break
+
+        if yes_price is None:
+            continue
+
+        if "president" in q: pres.append((m,yes_price))
+        if "nomination" in q or "primary" in q: nom.append((m,yes_price))
 
     for p in pres:
         for n in nom:
