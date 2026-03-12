@@ -4,17 +4,28 @@ import os
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# =========================
+# Telegram 推送
+# =========================
 def send_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
     requests.post(url, json=payload)
 
+
+# =========================
+# 获取 Polymarket 市场
+# =========================
 def fetch_markets():
     url = "https://gamma-api.polymarket.com/markets"
     params = {"active": "true", "closed": "false", "limit": 300}
     response = requests.get(url, params=params)
     return response.json()
 
+
+# =========================
+# Conditional Arb
+# =========================
 def detect_conditional(markets):
 
     base = []
@@ -53,6 +64,9 @@ def detect_conditional(markets):
     return ops
 
 
+# =========================
+# Release vs Announce Arb
+# =========================
 def detect_release(markets):
 
     release = []
@@ -75,6 +89,7 @@ def detect_release(markets):
 
         if "release" in q:
             release.append({"q": q, "p": price})
+
         if "announce" in q:
             announce.append({"q": q, "p": price})
 
@@ -87,18 +102,69 @@ def detect_release(markets):
 
                 if r["p"] > a["p"]:
                     gap = round(r["p"]-a["p"],3)
+
                     if gap > 0.05:
                         ops.append(("RELEASE",a,r,gap))
 
     return ops
 
 
+# =========================
+# Nomination Arb
+# =========================
+def detect_nomination(markets):
+
+    pres = []
+    nom = []
+
+    for m in markets:
+        if not m.get("question"):
+            continue
+
+        q = m["question"].lower()
+
+        try:
+            price = float(m["outcomes"][0]["price"])
+            liq = float(m["liquidity"])
+        except:
+            continue
+
+        if liq < 30000:
+            continue
+
+        if "president" in q:
+            pres.append({"q": q, "p": price})
+
+        if "nomination" in q or "primary" in q:
+            nom.append({"q": q, "p": price})
+
+    ops = []
+
+    for p in pres:
+        for n in nom:
+
+            if any(word in p["q"] for word in n["q"].split()):
+
+                if p["p"] > n["p"]:
+                    gap = round(p["p"]-n["p"],3)
+
+                    if gap > 0.05:
+                        ops.append(("NOMINATION",n,p,gap))
+
+    return ops
+
+
+# =========================
+# 主执行逻辑
+# =========================
 markets = fetch_markets()
 
 ops1 = detect_conditional(markets)
 ops2 = detect_release(markets)
+ops3 = detect_nomination(markets)
 
-ops = ops1 + ops2
+ops = ops1 + ops2 + ops3
+
 
 if len(ops)==0:
     send_alert("✅ Scan complete. No Logical Arb found.")
@@ -122,7 +188,8 @@ Gap={op[3]}
 BUY Base YES
 SELL Conditional YES
 """
-        else:
+
+        elif op[0]=="RELEASE":
             msg=f"""
 ⚠️ Release vs Announce Arb
 
@@ -138,6 +205,24 @@ Gap={op[3]}
 
 BUY Announce YES
 SELL Release YES
+"""
+
+        elif op[0]=="NOMINATION":
+            msg=f"""
+⚠️ Nomination Arb
+
+Nomination:
+{op[1]['q']}
+YES={op[1]['p']}
+
+Presidency:
+{op[2]['q']}
+YES={op[2]['p']}
+
+Gap={op[3]}
+
+BUY Nomination YES
+SELL Presidency YES
 """
 
         send_alert(msg)
