@@ -16,14 +16,16 @@ CLOB_API       = "https://clob.polymarket.com"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-MIN_LIQUIDITY  = 100    # minimum liquidity filter (USDC)
-PAGE_SIZE      = 100    # markets per API page
-MAX_PAGES      = 50     # max pages (50x100 = 5000 markets)
-REQUEST_DELAY  = 0.3    # seconds between requests
-STD_MULTIPLIER = 2.0    # std dev multiplier for dynamic thresholds
-EXPIRY_WINDOW  = 168    # hours to look ahead for near-expiry (7 days)
-MIN_EDGE       = 0.003  # minimum edge to report (0.3%), filter noise
-SPREAD_SAMPLE  = 50     # max markets to sample for CLOB spread stats
+MIN_LIQUIDITY  = 100
+PAGE_SIZE      = 100
+MAX_PAGES      = 50
+REQUEST_DELAY  = 0.3
+STD_MULTIPLIER = 2.0
+EXPIRY_WINDOW  = 168
+MIN_EDGE       = 0.01   # 1% minimum edge
+WATCH_PUSH_MIN = 0.02   # WATCH only pushed if edge > 2%
+SPREAD_SAMPLE  = 50
+CROSS_MIN_KEYS = 5      # tightened from 3 to 5
 
 # ----------------------------------------------------------------
 # Logging
@@ -209,6 +211,16 @@ def tokenize(question):
     words = re.findall(r"[a-zA-Z0-9]+", question.lower())
     stop = {"will","the","a","an","in","of","to","at","is","be","for","on","by","or","and","not","no","vs","who","what","when","does","would","have","has","did","this","that","their"}
     return set(w for w in words if w not in stop and len(w) > 2)
+
+
+def is_push_worthy(opp):
+    urgency = opp.get("urgency", "EARLY")
+    edge    = opp.get("edge", 0)
+    if urgency == "URGENT":
+        return True
+    if urgency == "WATCH" and edge >= WATCH_PUSH_MIN:
+        return True
+    return False
 
 
 # ----------------------------------------------------------------
@@ -433,9 +445,8 @@ def detect_clob_confirmed(market, threshold):
 
 
 # ----------------------------------------------------------------
-# ARB detectors - NEW
+# ARB detectors - NEW (tightened matching)
 # ----------------------------------------------------------------
-
 def detect_cross_market(markets, b_lower, b_upper):
     opps = []
     candidates = []
@@ -454,7 +465,7 @@ def detect_cross_market(markets, b_lower, b_upper):
             t1 = tokenize(q1)
             t2 = tokenize(q2)
             common = t1 & t2
-            if len(common) < 3:
+            if len(common) < CROSS_MIN_KEYS:
                 continue
             total = round(p1 + p2, 4)
             if total > b_upper:
@@ -518,7 +529,7 @@ def detect_parent_child(markets):
             q2 = m2.get("question", "")
             t1 = tokenize(q1)
             t2 = tokenize(q2)
-            if len(t1 & t2) < 3:
+            if len(t1 & t2) < CROSS_MIN_KEYS:
                 continue
             if broad1 and narrow2 and p2 > p1:
                 edge = round(p2 - p1, 4)
@@ -565,7 +576,7 @@ def detect_time_series(markets):
     for m in markets:
         prices = parse_prices(m)
         if len(prices) == 2:
-            q  = m.get("question", "").lower()
+            q = m.get("question", "").lower()
             found_time = [t for t in MONTHS if t in q]
             if found_time:
                 stem = re.sub(r"[,\\.\\?!]", "", q)
@@ -746,18 +757,17 @@ def fmt_opp(opp, idx):
     return out
 
 
-def build_tg_msg(opps, total, thresholds):
+def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    urgent_n = sum(1 for o in opps if o.get("urgency") == "URGENT")
-    watch_n  = sum(1 for o in opps if o.get("urgency") == "WATCH")
-    early_n  = sum(1 for o in opps if o.get("urgency") == "EARLY")
-    sorted_opps = sort_opps(opps)
-    msg = "<b>Polymarket ARB Scanner - " + str(len(opps)) + " opportunities</b>\n"
+    urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
+    watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
+    msg = "<b>Polymarket ARB Scanner - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
-    msg += "Markets scanned: " + str(total) + "\n"
-    msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch: " + str(watch_n) + "  🟢 Early: " + str(early_n) + "\n"
+    msg += "Markets scanned: " + str(total_markets) + "\n"
+    msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "\n"
+    msg += "Filtered out: " + str(filtered_n) + " (EARLY or edge<2%)\n"
     msg += "Thresholds: " + thresholds + "\n\n"
-    for idx, opp in enumerate(sorted_opps[:5], 1):
+    for idx, opp in enumerate(push_opps[:5], 1):
         url = opp.get("url","#")
         msg += "<b>#" + str(idx) + " " + opp["type"] + "</b>\n"
         msg += opp.get("market","N/A")[:60] + "\n"
@@ -772,6 +782,8 @@ def build_tg_msg(opps, total, thresholds):
         if "hours_left" in opp:
             msg += "Expires: " + str(opp["hours_left"]) + "h\n"
         msg += '<a href="' + url + '">View Market</a>\n\n'
+    if len(push_opps) > 5:
+        msg += "<i>... and " + str(len(push_opps) - 5) + " more in arb_report.json</i>\n"
     return msg
 
 
@@ -780,7 +792,7 @@ def build_tg_msg(opps, total, thresholds):
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner v3 - All 10 detectors + MIN_EDGE=" + str(MIN_EDGE))
+    log.info("Polymarket ARB Scanner v4 - MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN))
     log.info("Time: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     log.info("=" * 60)
 
@@ -836,54 +848,49 @@ def scan():
             unique_opps.append(o)
     opps = sort_opps(unique_opps)
 
-    urgent_n  = sum(1 for o in opps if o.get("urgency") == "URGENT")
-    watch_n   = sum(1 for o in opps if o.get("urgency") == "WATCH")
-    early_n   = sum(1 for o in opps if o.get("urgency") == "EARLY")
-    anchor_n  = sum(1 for o in opps if "Anchor" in o.get("type",""))
-    info_n    = sum(1 for o in opps if "Info ARB" in o.get("type",""))
-    cross_n   = sum(1 for o in opps if "Cross-Market" in o.get("type",""))
-    parent_n  = sum(1 for o in opps if "Parent-Child" in o.get("type",""))
-    ts_n      = sum(1 for o in opps if "Time-Series" in o.get("type",""))
-    spread_n  = sum(1 for o in opps if "Spread" in o.get("type",""))
-    under_n   = sum(1 for o in opps if "UNDER" in o.get("type",""))
-    over_n    = sum(1 for o in opps if "OVER" in o.get("type",""))
+    push_opps     = [o for o in opps if is_push_worthy(o)]
+    filtered_opps = [o for o in opps if not is_push_worthy(o)]
+    filtered_n    = len(filtered_opps)
+
+    urgent_n = sum(1 for o in opps if o.get("urgency") == "URGENT")
+    watch_n  = sum(1 for o in opps if o.get("urgency") == "WATCH")
+    early_n  = sum(1 for o in opps if o.get("urgency") == "EARLY")
+    pushed_n = len(push_opps)
 
     log.info("=" * 60)
-    log.info("DONE - " + str(len(opps)) + " opportunities (MIN_EDGE=" + str(MIN_EDGE) + ")")
-    log.info("  🔴 URGENT       : " + str(urgent_n))
-    log.info("  🟡 WATCH        : " + str(watch_n))
-    log.info("  🟢 EARLY        : " + str(early_n))
-    log.info("  💡 Price Anchor : " + str(anchor_n))
-    log.info("  🔍 Info ARB     : " + str(info_n))
-    log.info("  🔄 Cross-Market : " + str(cross_n))
-    log.info("  🧩 Parent-Child : " + str(parent_n))
-    log.info("  ⏰ Time-Series  : " + str(ts_n))
-    log.info("  📊 Liq Spread   : " + str(spread_n))
-    log.info("  📉 Multi UNDER  : " + str(under_n))
-    log.info("  📈 Multi OVER   : " + str(over_n))
+    log.info("DONE - " + str(len(opps)) + " total opportunities")
+    log.info("  🔴 URGENT   : " + str(urgent_n) + "  (all pushed)")
+    log.info("  🟡 WATCH    : " + str(watch_n) + "  (pushed if edge>=2%)")
+    log.info("  🟢 EARLY    : " + str(early_n) + "  (saved to file only)")
+    log.info("  📤 Pushed   : " + str(pushed_n))
+    log.info("  📁 Filtered : " + str(filtered_n))
     log.info("=" * 60)
 
     thr_str = "B=" + str(round(b_thr,4)) + " ML=" + str(round(m_low,4)) + " MH=" + str(round(m_high,4)) + " E=" + str(round(e_thr,4))
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    if not opps:
-        log.info("No opportunities this round")
+    for idx, opp in enumerate(opps, 1):
+        print(fmt_opp(opp, idx))
+
+    if not push_opps:
+        log.info("Nothing push-worthy this round")
         send_telegram(
             "<b>Polymarket ARB Scanner</b>\n"
             + "Time: " + now_str + "\n"
             + "Markets scanned: " + str(len(markets)) + "\n"
             + "Thresholds: " + thr_str + "\n"
-            + "Result: No opportunities found (MIN_EDGE=" + str(MIN_EDGE) + ")"
+            + "🔴 Urgent: 0  🟡 Watch(≥2%): 0\n"
+            + "Filtered (EARLY/low-edge): " + str(filtered_n) + "\n"
+            + "Result: No high-priority opportunities"
         )
     else:
-        for idx, opp in enumerate(opps, 1):
-            print(fmt_opp(opp, idx))
-        send_telegram(build_tg_msg(opps, len(markets), thr_str))
+        send_telegram(build_tg_msg(push_opps, len(opps), len(markets), thr_str, filtered_n))
 
     report = {
         "scan_time": datetime.now(timezone.utc).isoformat(),
         "total_markets_scanned": len(markets),
         "min_edge_filter": MIN_EDGE,
+        "watch_push_min": WATCH_PUSH_MIN,
         "dynamic_thresholds": {
             "bundle":      round(b_thr,4),
             "multi_lower": round(m_low,4),
@@ -892,16 +899,18 @@ def scan():
             "spread":      round(sp_thr,4),
         },
         "opportunities_summary": {
-            "total": len(opps), "urgent": urgent_n, "watch": watch_n, "early": early_n,
-            "price_anchor": anchor_n, "info_arb": info_n, "cross_market": cross_n,
-            "parent_child": parent_n, "time_series": ts_n, "liq_spread": spread_n,
-            "multi_under": under_n, "multi_over": over_n,
+            "total":    len(opps),
+            "pushed":   pushed_n,
+            "filtered": filtered_n,
+            "urgent":   urgent_n,
+            "watch":    watch_n,
+            "early":    early_n,
         },
         "opportunities": opps,
     }
     with open("arb_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
-    log.info("report saved to arb_report.json")
+    log.info("report saved to arb_report.json (" + str(len(opps)) + " total, " + str(pushed_n) + " pushed)")
 
 
 if __name__ == "__main__":
