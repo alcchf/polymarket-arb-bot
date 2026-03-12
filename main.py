@@ -12,8 +12,11 @@ daily_start_NAV=1000
 # Telegram
 # =========================
 def send(msg):
-    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url,json={"chat_id":CHAT_ID,"text":msg})
+    try:
+        url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url,json={"chat_id":CHAT_ID,"text":msg},timeout=5)
+    except:
+        pass
 
 # =========================
 # Kelly
@@ -152,10 +155,12 @@ def weather(ms):
         means.append(m3)
         stds.append(s3)
 
-    if len(means)==0:return
+    if len(means)==0:return False
 
     mean=sum(means)/len(means)
     std=sum(stds)/len(stds)
+
+    found=False
 
     for m in ms:
 
@@ -191,7 +196,7 @@ def weather(ms):
             url=f"https://polymarket.com/event/{slug}"
 
             send(f"""
-🌦️ Stable Ensemble Weather Arb
+🌦️ Ensemble Weather Arb
 
 Market:
 {m['question']}
@@ -209,6 +214,9 @@ BUY YES
 🔗 Trade:
 {url}
 """)
+            found=True
+
+    return found
 
 # =========================
 # Mutual Arb
@@ -216,6 +224,7 @@ BUY YES
 def mutual(ms):
 
     groups={}
+    found=False
 
     for m in ms:
 
@@ -258,10 +267,17 @@ SELL all YES
 🔗 Trade:
 {url}
 """)
+                        found=True
+
+    return found
 
 # =========================
 # Run
 # =========================
 ms=markets()
-weather(ms)
-mutual(ms)
+
+w=weather(ms)
+m=mutual(ms)
+
+if not w and not m:
+    send("✅ Bot ran successfully - No Arb Found")
