@@ -19,6 +19,8 @@ def send(msg):
     except Exception as e:
         print(f"[WARN] Telegram: {e}")
 
+# ✅ YES Price Parser
+# outcomePrices = '["0.27","0.73"]' → YES = prices[0]
 def parse_yes_price(market):
     try:
         op = market.get("outcomePrices")
@@ -30,35 +32,7 @@ def parse_yes_price(market):
         print(f"[WARN] parse_yes_price: {e}")
     return None
 
-# ✅ 加 markets=true 参数
-def fetch_events():
-    all_events = []
-    for offset in range(0, 1200, 100):
-        try:
-            r = requests.get(
-                f"{GAMMA_BASE}/events",
-                params={
-                    "active": "true",
-                    "limit": 100,
-                    "offset": offset,
-                    "markets": "true"    # ← 关键
-                },
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15
-            )
-            if r.status_code != 200:
-                print(f"[WARN] events offset={offset} status={r.status_code}")
-                continue
-            data = r.json()
-            if not isinstance(data, list) or len(data) == 0:
-                print(f"[INFO] events empty at offset={offset}")
-                break
-            all_events.extend(data)
-            print(f"[INFO] events offset={offset} page={len(data)} total={len(all_events)}")
-        except Exception as e:
-            print(f"[WARN] events offset={offset}: {e}")
-    return all_events
-
+# ✅ Fetch Markets (single source of truth)
 def fetch_markets():
     all_markets = []
     for offset in range(0, 2400, 300):
@@ -74,9 +48,11 @@ def fetch_markets():
                 timeout=10
             )
             if r.status_code != 200:
+                print(f"[WARN] markets offset={offset} status={r.status_code}")
                 continue
             data = r.json()
             if not isinstance(data, list) or len(data) == 0:
+                print(f"[INFO] markets empty at offset={offset}")
                 break
             all_markets.extend(data)
             print(f"[INFO] markets offset={offset} page={len(data)} total={len(all_markets)}")
@@ -84,52 +60,74 @@ def fetch_markets():
             print(f"[WARN] markets offset={offset}: {e}")
     return all_markets
 
-def partition_arb(events):
+# ✅ Partition Arb
+# 用 groupItemTitle 分组（/markets 里最可靠的字段）
+# 同时验证 endDate 相同（确保是同一个 Event 的 Buckets）
+def partition_arb(markets):
     found = False
-    arb_count = 0
+    groups = defaultdict(list)
 
-    for event in events:
-        title = event.get("title","") or event.get("slug","")
-        markets = event.get("markets",[])
-
-        if not isinstance(markets, list) or len(markets) < 3:
+    for m in markets:
+        g = m.get("groupItemTitle")
+        if not g:
             continue
 
-        buckets = []
-        for m in markets:
-            yes = parse_yes_price(m)
-            if yes is None:
-                continue
-            try:
-                liq = float(m.get("liquidity", 0))
-            except Exception:
-                liq = 0
-            buckets.append({
-                "question": m.get("question",""),
-                "yes": yes,
-                "slug": m.get("slug",""),
-                "liq": liq,
-            })
+        # 必须有结束日期（用来验证是同一 Event）
+        end = m.get("endDate") or m.get("end") or ""
+
+        # 用 groupItemTitle + endDate 作为复合 key
+        # 这样确保只有同一事件同一时间的 Buckets 被分在一组
+        key = f"{g}||{end}"
+
+        try:
+            liq = float(m.get("liquidity", 0))
+        except Exception:
+            liq = 0
+
+        # Partition Arb 不需要高流动性
+        # 只要有流动性就可以
+        if liq < 100:
+            continue
+
+        yes = parse_yes_price(m)
+        if yes is None:
+            continue
+
+        groups[key].append({
+            "question": m.get("question", ""),
+            "yes": yes,
+            "slug": m.get("slug", ""),
+            "liq": liq,
+            "group": g,
+        })
+
+    print(f"[INFO] partition groups: {len(groups)}")
+
+    arb_count = 0
+
+    for key, buckets in groups.items():
 
         if len(buckets) < 3:
             continue
 
         sum_yes = sum(b["yes"] for b in buckets)
-        print(f"[DEBUG] '{title[:50]}' buckets={len(buckets)} sum={round(sum_yes,4)}")
+        group_name = buckets[0].get("group", "")
 
-        slug = buckets[0].get("slug","")
+        print(f"[DEBUG] '{group_name[:50]}' n={len(buckets)} Σ={round(sum_yes,4)}")
+
+        slug = buckets[0].get("slug", "")
         url = f"https://polymarket.com/event/{slug}" if slug else ""
 
         if sum_yes > 1.03:
-            found = True
             arb_count += 1
+            found = True
             lines = [
                 "🚨🚨🚨 EXECUTE NOW 🚨🚨🚨",
                 "Partition Arb → BUY ALL NO",
-                f"Event: {title[:60]}",
+                f"Group: {group_name[:60]}",
                 f"Σ YES = {round(sum_yes,4)}",
                 f"Profit ≈ {round(sum_yes-1,4)}",
-                "Buckets:"
+                f"Buckets ({len(buckets)}):"
             ]
             for b in sorted(buckets, key=lambda x: x["yes"], reverse=True)[:8]:
                 lines.append(f"  {round(b['yes'],3)}  {b['question'][:50]}")
@@ -138,15 +136,15 @@ def partition_arb(events):
             send("\n".join(lines))
 
         elif sum_yes < 0.97:
-            found = True
             arb_count += 1
+            found = True
             lines = [
                 "🚨🚨🚨 EXECUTE NOW 🚨🚨🚨",
                 "Partition Arb → BUY ALL YES",
-                f"Event: {title[:60]}",
+                f"Group: {group_name[:60]}",
                 f"Σ YES = {round(sum_yes,4)}",
                 f"Profit ≈ {round(1-sum_yes,4)}",
-                "Buckets:"
+                f"Buckets ({len(buckets)}):"
             ]
             for b in sorted(buckets, key=lambda x: x["yes"], reverse=True)[:8]:
                 lines.append(f"  {round(b['yes'],3)}  {b['question'][:50]}")
@@ -154,9 +152,10 @@ def partition_arb(events):
                 lines.append(f"\n🔗 {url}")
             send("\n".join(lines))
 
-    print(f"[INFO] partition arb found: {arb_count}")
+    print(f"[INFO] partition arb count: {arb_count}")
     return found
 
+# ✅ Mutual Outcome Arb
 def mutual_arb(markets):
     found = False
     groups = defaultdict(list)
@@ -166,7 +165,7 @@ def mutual_arb(markets):
         if not g:
             continue
         try:
-            liq = float(m.get("liquidity",0))
+            liq = float(m.get("liquidity", 0))
         except Exception:
             continue
         if liq < 5000:
@@ -175,9 +174,9 @@ def mutual_arb(markets):
         if yes is None:
             continue
         groups[g].append({
-            "question": m.get("question",""),
+            "question": m.get("question", ""),
             "yes": yes,
-            "slug": m.get("slug",""),
+            "slug": m.get("slug", ""),
         })
 
     for g, items in groups.items():
@@ -186,13 +185,13 @@ def mutual_arb(markets):
         s = sum(i["yes"] for i in items)
         if s > 1.05:
             found = True
-            slug = items[0].get("slug","")
+            slug = items[0].get("slug", "")
             url = f"https://polymarket.com/event/{slug}" if slug else ""
             lines = [
                 "⚠️ Mutual Outcome Arb",
                 f"Σ YES = {round(s,4)}",
                 f"Gap = {round(s-1,4)}",
-                "SELL all YES",""
+                "SELL all YES", ""
             ]
             for i in items[:6]:
                 lines.append(f"  {round(i['yes'],3)}  {i['question'][:50]}")
@@ -202,6 +201,7 @@ def mutual_arb(markets):
 
     return found
 
+# ✅ Nomination Arb
 def nomination_arb(markets):
     found = False
     pres = []
@@ -214,9 +214,9 @@ def nomination_arb(markets):
     }
 
     for m in markets:
-        q = m.get("question","").lower()
+        q = m.get("question", "").lower()
         try:
-            liq = float(m.get("liquidity",0))
+            liq = float(m.get("liquidity", 0))
         except Exception:
             continue
         if liq < 5000:
@@ -231,16 +231,16 @@ def nomination_arb(markets):
 
     for p_m, p_price in pres:
         for n_m, n_price in nom:
-            pq = p_m.get("question","").lower()
-            nq = n_m.get("question","").lower()
-            p_words = {w for w in pq.split() if len(w)>2 and w not in stop}
-            n_words = {w for w in nq.split() if len(w)>2 and w not in stop}
+            pq = p_m.get("question", "").lower()
+            nq = n_m.get("question", "").lower()
+            p_words = {w for w in pq.split() if len(w) > 2 and w not in stop}
+            n_words = {w for w in nq.split() if len(w) > 2 and w not in stop}
             if len(p_words & n_words) < 2:
                 continue
             gap = p_price - n_price
             if gap > 0.05:
                 found = True
-                slug = n_m.get("slug","")
+                slug = n_m.get("slug", "")
                 url = f"https://polymarket.com/event/{slug}" if slug else ""
                 send(
                     f"🚨 EXECUTE NOW\n\n"
@@ -255,17 +255,17 @@ def nomination_arb(markets):
 
     return found
 
+# =========================
+# Run
+# =========================
 def main():
     ts = int(time.time())
     print(f"[START] ts={ts}")
 
-    events = fetch_events()
-    print(f"[INFO] total events: {len(events)}")
-
     markets = fetch_markets()
     print(f"[INFO] total markets: {len(markets)}")
 
-    p = partition_arb(events)
+    p = partition_arb(markets)
     m1 = mutual_arb(markets)
     m2 = nomination_arb(markets)
 
