@@ -9,11 +9,37 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-USER_AGENT = "Mozilla/5.0 (compatible; StrictWeatherDiscovery/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; PolymarketReadOnlyVerifier/1.0)"
 PAGE_SIZE = 300
 MAX_OFFSET = 2400
 TIMEOUT = 10
 
+# =========================
+# 严格天气市场识别规则（最小改动替换原 TEMP_KEYWORDS 逻辑）
+# =========================
+WEATHER_INCLUDE_PATTERNS = [
+    r"\bhighest temperature\b",
+    r"\bhigh temperature\b",
+    r"\btemperature in\b",
+    r"\bhighest temp\b",
+    r"\bhigh temp\b",
+]
+
+WEATHER_UNIT_PATTERNS = [
+    r"°c",
+    r"°f",
+    r"\bcelsius\b",
+    r"\bfahrenheit\b",
+]
+
+WEATHER_EXCLUDE_KEYWORDS = [
+    "btc", "eth", "sol", "xrp", "doge",
+    "coinbase", "defi", "finance", "market cap",
+    "dominance", "nasdaq", "dow", "s&p", "stock",
+    "price target", "earnings", "revenue", "valuation",
+    "global temperature", "average global temperature",
+    "coingecko", "token", "crypto", "coin"
+]
 
 # =========================
 # Telegram
@@ -26,18 +52,19 @@ def send(msg: str):
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(
+        r = requests.post(
             url,
             json={"chat_id": CHAT_ID, "text": msg[:4000]},
             timeout=5
         )
+        print(f"[INFO] Telegram status={r.status_code}")
+        print(f"[INFO] Telegram response={r.text[:500]}")
     except Exception as e:
         print(f"[WARN] Telegram send failed: {e}")
         print(msg)
 
-
 # =========================
-# 安全 GET
+# Safe GET
 # =========================
 def safe_get(url, params=None):
     try:
@@ -51,9 +78,8 @@ def safe_get(url, params=None):
     except Exception as e:
         return None, str(e)
 
-
 # =========================
-# 深分页抓市场
+# Deep pagination fetch
 # =========================
 def fetch_markets():
     raw = []
@@ -122,16 +148,16 @@ def fetch_markets():
 
     return raw, page_reports
 
-
 # =========================
-# 解析 YES 价格（只读）
-# 支持：
+# Parse YES price robustly
+#
+# Supports common shapes:
 # 1) outcomePrices = '["0.27","0.73"]'
 # 2) outcomes = [{"name":"Yes","price":"0.27"}, ...]
 # 3) outcomes = "Yes,No" + outcomePrices = "0.27,0.73"
 # =========================
 def parse_yes_price(m):
-    # Case 1: outcomePrices JSON string
+    # Case 1: outcomePrices as JSON string
     try:
         op = m.get("outcomePrices")
         if isinstance(op, str) and op.strip():
@@ -168,64 +194,33 @@ def parse_yes_price(m):
 
     return None, None
 
-
 # =========================
-# 严格天气市场识别
+# 严格天气检测（替换原 is_temperature_like）
 # =========================
-WEATHER_INCLUDE_PATTERNS = [
-    r"\bhighest temperature\b",
-    r"\bhigh temperature\b",
-    r"\btemperature in\b",
-    r"\bhighest temp\b",
-    r"\bhigh temp\b",
-]
-
-WEATHER_UNIT_PATTERNS = [
-    r"°c",
-    r"°f",
-    r"\bcelsius\b",
-    r"\bfahrenheit\b",
-]
-
-WEATHER_EXCLUDE_KEYWORDS = [
-    "btc", "eth", "sol", "xrp", "doge",
-    "coinbase", "defi", "finance", "market cap",
-    "dominance", "nasdaq", "dow", "s&p", "stock",
-    "price target", "earnings", "revenue", "valuation",
-    "global temperature", "average global temperature",
-    "coingecko", "token", "crypto", "coin"
-]
-
 def is_strict_weather_market(m):
     q = str(m.get("question", "")).lower()
     g = str(m.get("groupItemTitle", "")).lower()
     text = f"{q} || {g}"
 
-    # 先排除明显不是天气的
+    # 排除明显不是天气的
     for bad in WEATHER_EXCLUDE_KEYWORDS:
         if bad in text:
             return False
 
-    # 必须命中强天气模式
     matched_weather = any(re.search(p, text) for p in WEATHER_INCLUDE_PATTERNS)
-
-    # 单位加分，但不是绝对必须
     matched_unit = any(re.search(p, text) for p in WEATHER_UNIT_PATTERNS)
 
-    # 允许没有单位，但必须至少像 “highest temperature in ...”
     if matched_weather:
         return True
 
-    # 如果 question/groupItemTitle 同时包含 temp/temperature 和单位，也放行
     if ("temperature" in text or "temp" in text) and matched_unit:
         return True
 
     return False
 
-
 # =========================
-# 分组 key（只做快照，不做交易判断）
-# groupItemTitle + endDate 比较保守
+# Group key for read-only snapshots
+# 只做天气市场的人工核验，不做套利判断
 # =========================
 def snapshot_group_key(m):
     group_title = str(m.get("groupItemTitle") or "").strip()
@@ -240,9 +235,8 @@ def snapshot_group_key(m):
 
     return None
 
-
 # =========================
-# 基础诊断
+# Build diagnostics
 # =========================
 def build_diagnostics(markets):
     diag = {
@@ -296,9 +290,8 @@ def build_diagnostics(markets):
 
     return diag
 
-
 # =========================
-# 收集严格天气市场样本
+# Collect strict weather market examples
 # =========================
 def collect_strict_weather_examples(markets, limit=12):
     out = []
@@ -325,15 +318,16 @@ def collect_strict_weather_examples(markets, limit=12):
 
     return out
 
-
 # =========================
-# 构建“天气市场分组快照”
-# 只输出 bucket 数量和 YES 总和，不做套利判断
+# Build grouped snapshots (strict weather only)
+# 只做“每组有几个 bucket、每个 bucket 的 YES 值”
+# 不做任何套利阈值判断
 # =========================
-def build_weather_group_snapshots(markets, min_group_size=2, limit_groups=10):
+def build_group_snapshots(markets, min_group_size=2, limit_groups=10):
     groups = defaultdict(list)
 
     for m in markets:
+        # ✅ 关键：只对严格天气市场做分组
         if not is_strict_weather_market(m):
             continue
 
@@ -342,3 +336,117 @@ def build_weather_group_snapshots(markets, min_group_size=2, limit_groups=10):
             continue
 
         yes_price, mode = parse_yes_price(m)
+        if yes_price is None:
+            continue
+
+        groups[key].append({
+            "question": m.get("question", ""),
+            "yes": yes_price,
+            "slug": m.get("slug", ""),
+            "liquidity": m.get("liquidity"),
+            "mode": mode,
+        })
+
+    filtered = []
+    for key, items in groups.items():
+        if len(items) >= min_group_size:
+            filtered.append((key, items))
+
+    filtered.sort(key=lambda x: len(x[1]), reverse=True)
+
+    snapshots = []
+    for key, items in filtered[:limit_groups]:
+        snapshots.append({
+            "group_key": key,
+            "bucket_count": len(items),
+            "sum_yes": round(sum(x["yes"] for x in items), 6),
+            "items": [
+                {
+                    "yes": round(x["yes"], 6),
+                    "question": x["question"][:100],
+                    "slug": x["slug"],
+                }
+                for x in items[:12]
+            ]
+        })
+
+    return snapshots
+
+# =========================
+# Main
+# =========================
+def main():
+    ts = int(time.time())
+
+    raw, page_reports = fetch_markets()
+
+    # de-dup by id
+    uniq = {}
+    for m in raw:
+        mid = m.get("id")
+        if mid:
+            uniq[str(mid)] = m
+    markets = list(uniq.values())
+
+    diag = build_diagnostics(markets)
+    weather_examples = collect_strict_weather_examples(markets, limit=10)
+    group_snapshots = build_group_snapshots(markets, min_group_size=2, limit_groups=8)
+
+    # Console logs (GitHub Actions)
+    print("=== PAGE REPORTS ===")
+    for p in page_reports:
+        print(p)
+
+    print("=== DIAGNOSTICS ===")
+    print(json.dumps(diag, ensure_ascii=False, indent=2))
+
+    print("=== STRICT WEATHER EXAMPLES ===")
+    print(json.dumps(weather_examples, ensure_ascii=False, indent=2))
+
+    print("=== WEATHER GROUP SNAPSHOTS ===")
+    print(json.dumps(group_snapshots, ensure_ascii=False, indent=2))
+
+    # Telegram summary
+    lines = [
+        f"✅ Strict weather discovery @ {ts}",
+        f"📊 Raw fetched: {len(raw)}",
+        f"✅ Unique markets: {diag['unique_ids']}",
+        f"🔗 with slug: {diag['with_slug']}",
+        f"🧩 with groupItemTitle: {diag['with_groupItemTitle']}",
+        f"🧠 with conditionId: {diag['with_conditionId']}",
+        f"📚 with events: {diag['with_events']}",
+        f"💲 YES parsed OK: {diag['yes_price_ok']}",
+        f"⚠️ YES parse failed: {diag['yes_price_fail']}",
+        f"🌡️ strict weather markets: {diag['strict_weather_count']}",
+        f"🛠️ YES parse modes: {diag['yes_price_modes']}",
+    ]
+
+    if diag["top_groups"]:
+        lines.append("📌 Top groups:")
+        for g, c in diag["top_groups"][:5]:
+            short = g if len(g) <= 50 else g[:47] + "..."
+            lines.append(f"- {short} ({c})")
+
+    if weather_examples:
+        lines.append("🌡️ Weather samples:")
+        for t in weather_examples[:3]:
+            q = t["question"]
+            short_q = q if len(q) <= 48 else q[:45] + "..."
+            lines.append(f"- yes={t['yes_price']} | {short_q}")
+    else:
+        lines.append("🌡️ Weather samples: NONE")
+
+    if group_snapshots:
+        lines.append("🧪 Weather snapshots:")
+        for s in group_snapshots[:3]:
+            g = s["group_key"]
+            short_g = g if len(g) <= 45 else g[:42] + "..."
+            lines.append(f"- n={s['bucket_count']} sum={s['sum_yes']} | {short_g}")
+    else:
+        lines.append("🧪 Weather snapshots: NONE")
+
+    send("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()
