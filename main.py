@@ -13,7 +13,7 @@ def send(msg):
     except: pass
 
 # =========================
-# ✅ Deep Pagination Market Fetch
+# ✅ Deep Pagination + Unique Check
 # =========================
 def markets():
 
@@ -44,7 +44,16 @@ def markets():
         except:
             continue
 
-    send(f"📊 Markets fetched: {len(all)}")
+    # ✅ Unique Market Check
+    ids=set()
+    for m in all:
+        if m.get("id"):
+            ids.add(m["id"])
+
+    send(f"""
+📊 Raw fetched: {len(all)}
+✅ Unique markets: {len(ids)}
+""")
 
     return all
 
