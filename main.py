@@ -4,7 +4,9 @@ import json
 import math
 import logging
 import requests
+import re
 from datetime import datetime, timezone
+from collections import defaultdict
 
 # ----------------------------------------------------------------
 # Config
@@ -14,12 +16,14 @@ CLOB_API       = "https://clob.polymarket.com"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-MIN_LIQUIDITY  = 100
-PAGE_SIZE      = 100
-MAX_PAGES      = 50
-REQUEST_DELAY  = 0.3
-STD_MULTIPLIER = 2.0
-EXPIRY_WINDOW  = 168
+MIN_LIQUIDITY  = 100    # minimum liquidity filter (USDC)
+PAGE_SIZE      = 100    # markets per API page
+MAX_PAGES      = 50     # max pages (50x100 = 5000 markets)
+REQUEST_DELAY  = 0.3    # seconds between requests
+STD_MULTIPLIER = 2.0    # std dev multiplier for dynamic thresholds
+EXPIRY_WINDOW  = 168    # hours to look ahead for near-expiry (7 days)
+MIN_EDGE       = 0.003  # minimum edge to report (0.3%), filter noise
+SPREAD_SAMPLE  = 50     # max markets to sample for CLOB spread stats
 
 # ----------------------------------------------------------------
 # Logging
@@ -73,6 +77,21 @@ def gamma_get(path, params=None):
     except Exception as ex:
         log.warning("Gamma API error " + path + ": " + str(ex))
         return None
+
+
+def clob_get_spread(token_id):
+    try:
+        rb = SESSION.get(CLOB_API + "/price",
+                         params={"token_id": token_id, "side": "BUY"}, timeout=8)
+        rs = SESSION.get(CLOB_API + "/price",
+                         params={"token_id": token_id, "side": "SELL"}, timeout=8)
+        ask = float(rb.json().get("price", 0))
+        bid = float(rs.json().get("price", 0))
+        if ask > 0 and bid > 0 and ask > bid:
+            return round(ask - bid, 4), round((ask + bid) / 2, 4)
+        return None, None
+    except Exception:
+        return None, None
 
 
 def clob_midprice(token_id):
@@ -138,7 +157,7 @@ def fetch_all_markets():
 
 
 # ----------------------------------------------------------------
-# Price parsing
+# Price parsing & helpers
 # ----------------------------------------------------------------
 def parse_prices(market):
     prices = []
@@ -171,6 +190,27 @@ def get_urgency(hours_left):
     return "EARLY", "🟢 EARLY"
 
 
+def hours_until_expiry(market):
+    end_date = market.get("endDate") or market.get("end_date_iso")
+    if not end_date:
+        return None
+    try:
+        ed = end_date.replace("Z", "+00:00")
+        expiry = datetime.fromisoformat(ed)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        h = (expiry - datetime.now(timezone.utc)).total_seconds() / 3600
+        return h if h > 0 else None
+    except Exception:
+        return None
+
+
+def tokenize(question):
+    words = re.findall(r"[a-zA-Z0-9]+", question.lower())
+    stop = {"will","the","a","an","in","of","to","at","is","be","for","on","by","or","and","not","no","vs","who","what","when","does","would","have","has","did","this","that","their"}
+    return set(w for w in words if w not in stop and len(w) > 2)
+
+
 # ----------------------------------------------------------------
 # Dynamic threshold computation
 # ----------------------------------------------------------------
@@ -188,7 +228,22 @@ def analyze_markets(markets):
     bundle_sums = []
     multi_sums  = []
     expiry_gaps = []
+    spreads     = []
     now = datetime.now(timezone.utc)
+
+    sampled = 0
+    for market in markets:
+        if sampled >= SPREAD_SAMPLE:
+            break
+        tokens = market.get("tokens", [])
+        if len(tokens) == 2:
+            tid = tokens[0].get("token_id") or tokens[0].get("tokenId")
+            if tid:
+                sp, mid = clob_get_spread(tid)
+                if sp is not None:
+                    spreads.append(sp)
+                    sampled += 1
+                time.sleep(0.1)
 
     for market in markets:
         prices = parse_prices(market)
@@ -203,61 +258,57 @@ def analyze_markets(markets):
                 expiry = datetime.fromisoformat(ed)
                 if expiry.tzinfo is None:
                     expiry = expiry.replace(tzinfo=timezone.utc)
-                hours_left = (expiry - now).total_seconds() / 3600
-                if 0 < hours_left < EXPIRY_WINDOW:
+                h = (expiry - now).total_seconds() / 3600
+                if 0 < h < EXPIRY_WINDOW:
                     for p in prices:
-                        deviation = min(p, 1 - p)
-                        expiry_gaps.append((hours_left, deviation))
+                        expiry_gaps.append((h, min(p, 1 - p)))
             except Exception:
                 pass
 
     b_mean, b_std = compute_stats(bundle_sums)
-    if b_mean is not None and b_std is not None:
-        bundle_threshold = b_mean - STD_MULTIPLIER * b_std
-    else:
-        bundle_threshold = 0.97
+    bundle_threshold = (b_mean - STD_MULTIPLIER * b_std) if b_mean is not None else 0.97
 
     m_mean, m_std = compute_stats(multi_sums)
-    if m_mean is not None and m_std is not None:
+    if m_mean is not None:
         multi_lower = m_mean - STD_MULTIPLIER * m_std
         multi_upper = m_mean + STD_MULTIPLIER * m_std
     else:
-        multi_lower = 0.97
-        multi_upper = 1.03
+        multi_lower, multi_upper = 0.97, 1.03
 
     if expiry_gaps:
-        deviations = [d for (h, d) in expiry_gaps]
-        dev_mean, dev_std = compute_stats(deviations)
-        if dev_mean is not None and dev_std is not None:
-            near_expiry_dev_threshold = dev_mean + STD_MULTIPLIER * dev_std
-        else:
-            near_expiry_dev_threshold = 0.15
+        devs = [d for (h, d) in expiry_gaps]
+        dev_mean, dev_std = compute_stats(devs)
+        expiry_threshold = (dev_mean + STD_MULTIPLIER * dev_std) if dev_mean is not None else 0.15
     else:
-        near_expiry_dev_threshold = 0.15
+        expiry_threshold = 0.15
         dev_mean, dev_std = 0.15, 0.0
+
+    spread_mean, spread_std = compute_stats(spreads)
+    spread_threshold = (spread_mean + STD_MULTIPLIER * spread_std) if spread_mean is not None else 0.05
 
     log.info("=== Dynamic Thresholds ===")
     if b_mean is not None:
         log.info("Bundle     -> mean=" + str(round(b_mean,4)) + " std=" + str(round(b_std,4)) + " lower=" + str(round(bundle_threshold,4)))
     if m_mean is not None:
-        log.info("Multi  LOW -> mean=" + str(round(m_mean,4)) + " std=" + str(round(m_std,4)) + " lower=" + str(round(multi_lower,4)))
-        log.info("Multi HIGH -> upper=" + str(round(multi_upper,4)) + "  (overround threshold)")
-    log.info("Expiry     -> mean=" + str(round(dev_mean,4)) + " std=" + str(round(dev_std,4)) + " threshold=" + str(round(near_expiry_dev_threshold,4)))
+        log.info("Multi  LOW -> lower=" + str(round(multi_lower,4)) + "  HIGH -> upper=" + str(round(multi_upper,4)))
+    log.info("Expiry     -> threshold=" + str(round(expiry_threshold,4)))
+    if spread_mean is not None:
+        log.info("Spread     -> mean=" + str(round(spread_mean,4)) + " threshold=" + str(round(spread_threshold,4)))
     log.info("=========================")
 
-    return bundle_threshold, multi_lower, multi_upper, near_expiry_dev_threshold
+    return bundle_threshold, multi_lower, multi_upper, expiry_threshold, spread_threshold
 
 
 # ----------------------------------------------------------------
-# ARB detectors
+# ARB detectors - existing
 # ----------------------------------------------------------------
 def detect_bundle(market, threshold):
     prices = parse_prices(market)
     if len(prices) != 2:
         return None
     total = sum(prices)
-    if total < threshold:
-        edge = round(1.0 - total, 4)
+    edge = round(1.0 - total, 4)
+    if total < threshold and edge >= MIN_EDGE:
         return {
             "type": "Bundle ARB (YES+NO < 1)",
             "market": market.get("question", market.get("slug", "N/A")),
@@ -279,8 +330,8 @@ def detect_multi_under(market, threshold):
     if len(prices) < 3:
         return None
     total = sum(prices)
-    if total < threshold:
-        edge = round(1.0 - total, 4)
+    edge = round(1.0 - total, 4)
+    if total < threshold and edge >= MIN_EDGE:
         return {
             "type": "Multi-Outcome UNDER ARB (" + str(len(prices)) + " outcomes)",
             "market": market.get("question", market.get("slug", "N/A")),
@@ -302,8 +353,8 @@ def detect_multi_over(market, threshold):
     if len(prices) < 3:
         return None
     total = sum(prices)
-    if total > threshold:
-        overround = round(total - 1.0, 4)
+    overround = round(total - 1.0, 4)
+    if total > threshold and overround >= MIN_EDGE:
         return {
             "type": "Multi-Outcome OVER ARB (" + str(len(prices)) + " outcomes)",
             "market": market.get("question", market.get("slug", "N/A")),
@@ -322,39 +373,29 @@ def detect_multi_over(market, threshold):
 
 
 def detect_near_expiry(market, dev_threshold):
-    end_date = market.get("endDate") or market.get("end_date_iso")
-    if not end_date:
+    h = hours_until_expiry(market)
+    if h is None or h >= EXPIRY_WINDOW:
         return None
-    try:
-        ed = end_date.replace("Z", "+00:00")
-        expiry = datetime.fromisoformat(ed)
-        if expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        hours_left = (expiry - now).total_seconds() / 3600
-        if 0 < hours_left < EXPIRY_WINDOW:
-            prices = parse_prices(market)
-            suspicious = []
-            for p in prices:
-                deviation = min(p, 1 - p)
-                if deviation > dev_threshold:
-                    suspicious.append(round(p, 4))
-            if suspicious:
-                urgency_key, urgency_label = get_urgency(hours_left)
-                return {
-                    "type": urgency_label + " Near-Expiry Mispricing",
-                    "market": market.get("question", market.get("slug", "N/A")),
-                    "url": get_url(market),
-                    "prices": prices,
-                    "hours_left": round(hours_left, 2),
-                    "suspicious": suspicious,
-                    "liquidity": market.get("liquidity", "N/A"),
-                    "threshold_used": round(dev_threshold, 4),
-                    "urgency": urgency_key,
-                    "action": "Check price direction vs reality",
-                }
-    except Exception:
-        pass
+    prices = parse_prices(market)
+    suspicious = [round(p, 4) for p in prices if min(p, 1 - p) > dev_threshold]
+    if suspicious:
+        urgency_key, urgency_label = get_urgency(h)
+        edge = round(max(min(p, 1 - p) for p in suspicious), 4)
+        if edge < MIN_EDGE:
+            return None
+        return {
+            "type": urgency_label + " Near-Expiry Mispricing",
+            "market": market.get("question", market.get("slug", "N/A")),
+            "url": get_url(market),
+            "prices": prices,
+            "hours_left": round(h, 2),
+            "suspicious": suspicious,
+            "liquidity": market.get("liquidity", "N/A"),
+            "threshold_used": round(dev_threshold, 4),
+            "urgency": urgency_key,
+            "edge": edge,
+            "action": "Check price direction vs reality",
+        }
     return None
 
 
@@ -373,8 +414,8 @@ def detect_clob_confirmed(market, threshold):
         time.sleep(0.15)
     if len(clob_prices) == 2:
         total = sum(clob_prices)
-        if total < threshold:
-            edge = round(1.0 - total, 4)
+        edge = round(1.0 - total, 4)
+        if total < threshold and edge >= MIN_EDGE:
             return {
                 "type": "CLOB-Confirmed Bundle ARB",
                 "market": market.get("question", market.get("slug", "N/A")),
@@ -392,13 +433,291 @@ def detect_clob_confirmed(market, threshold):
 
 
 # ----------------------------------------------------------------
+# ARB detectors - NEW
+# ----------------------------------------------------------------
+
+def detect_cross_market(markets, b_lower, b_upper):
+    opps = []
+    candidates = []
+    for m in markets:
+        prices = parse_prices(m)
+        if len(prices) == 2:
+            candidates.append((m, prices[0]))
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            m1, p1 = candidates[i]
+            m2, p2 = candidates[j]
+            q1 = m1.get("question", "")
+            q2 = m2.get("question", "")
+            if not q1 or not q2:
+                continue
+            t1 = tokenize(q1)
+            t2 = tokenize(q2)
+            common = t1 & t2
+            if len(common) < 3:
+                continue
+            total = round(p1 + p2, 4)
+            if total > b_upper:
+                overround = round(total - 1.0, 4)
+                if overround >= MIN_EDGE:
+                    opps.append({
+                        "type": "Cross-Market OVER ARB",
+                        "market": q1[:60] + " | " + q2[:60],
+                        "url": get_url(m1),
+                        "url2": get_url(m2),
+                        "prices": [p1, p2],
+                        "sum": total,
+                        "overround": overround,
+                        "overround_pct": "{:.2f}%".format(overround * 100),
+                        "edge": overround,
+                        "liquidity": str(m1.get("liquidity","N/A")) + " / " + str(m2.get("liquidity","N/A")),
+                        "threshold_used": round(b_upper, 4),
+                        "urgency": "WATCH",
+                        "action": "SELL YES on both markets",
+                        "common_keywords": list(common)[:5],
+                    })
+            elif total < b_lower:
+                edge = round(1.0 - total, 4)
+                if edge >= MIN_EDGE:
+                    opps.append({
+                        "type": "Cross-Market UNDER ARB",
+                        "market": q1[:60] + " | " + q2[:60],
+                        "url": get_url(m1),
+                        "url2": get_url(m2),
+                        "prices": [p1, p2],
+                        "sum": total,
+                        "edge": edge,
+                        "edge_pct": "{:.2f}%".format(edge * 100),
+                        "liquidity": str(m1.get("liquidity","N/A")) + " / " + str(m2.get("liquidity","N/A")),
+                        "threshold_used": round(b_lower, 4),
+                        "urgency": "WATCH",
+                        "action": "BUY YES on both markets",
+                        "common_keywords": list(common)[:5],
+                    })
+    return opps
+
+
+def detect_parent_child(markets):
+    opps = []
+    BROAD  = {"reach","advance","qualify","enter","make","final","semifinal","playoff","round"}
+    NARROW = {"win","champion","winner","title","trophy","gold","first"}
+    candidates = []
+    for m in markets:
+        prices = parse_prices(m)
+        if len(prices) == 2:
+            q = m.get("question", "").lower()
+            words = set(re.findall(r"[a-zA-Z0-9]+", q))
+            is_broad  = bool(words & BROAD)
+            is_narrow = bool(words & NARROW)
+            candidates.append((m, prices[0], is_broad, is_narrow))
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            m1, p1, broad1, narrow1 = candidates[i]
+            m2, p2, broad2, narrow2 = candidates[j]
+            q1 = m1.get("question", "")
+            q2 = m2.get("question", "")
+            t1 = tokenize(q1)
+            t2 = tokenize(q2)
+            if len(t1 & t2) < 3:
+                continue
+            if broad1 and narrow2 and p2 > p1:
+                edge = round(p2 - p1, 4)
+                if edge >= MIN_EDGE:
+                    opps.append({
+                        "type": "Parent-Child Contradiction",
+                        "market": "PARENT: " + q1[:50] + " | CHILD: " + q2[:50],
+                        "url": get_url(m1),
+                        "url2": get_url(m2),
+                        "prices": [round(p1,4), round(p2,4)],
+                        "edge": edge,
+                        "edge_pct": "{:.2f}%".format(edge * 100),
+                        "liquidity": str(m1.get("liquidity","N/A")) + " / " + str(m2.get("liquidity","N/A")),
+                        "threshold_used": MIN_EDGE,
+                        "urgency": "WATCH",
+                        "action": "BUY parent YES + SELL child YES",
+                    })
+            elif broad2 and narrow1 and p1 > p2:
+                edge = round(p1 - p2, 4)
+                if edge >= MIN_EDGE:
+                    opps.append({
+                        "type": "Parent-Child Contradiction",
+                        "market": "PARENT: " + q2[:50] + " | CHILD: " + q1[:50],
+                        "url": get_url(m2),
+                        "url2": get_url(m1),
+                        "prices": [round(p2,4), round(p1,4)],
+                        "edge": edge,
+                        "edge_pct": "{:.2f}%".format(edge * 100),
+                        "liquidity": str(m2.get("liquidity","N/A")) + " / " + str(m1.get("liquidity","N/A")),
+                        "threshold_used": MIN_EDGE,
+                        "urgency": "WATCH",
+                        "action": "BUY parent YES + SELL child YES",
+                    })
+    return opps
+
+
+def detect_time_series(markets):
+    opps = []
+    MONTHS = ["january","february","march","april","may","june",
+              "july","august","september","october","november","december",
+              "jan","feb","mar","apr","jun","jul","aug","sep","oct","nov","dec",
+              "q1","q2","q3","q4","2025","2026","2027","2028"]
+    candidates = []
+    for m in markets:
+        prices = parse_prices(m)
+        if len(prices) == 2:
+            q  = m.get("question", "").lower()
+            found_time = [t for t in MONTHS if t in q]
+            if found_time:
+                stem = re.sub(r"[,\\.\\?!]", "", q)
+                for t in MONTHS:
+                    stem = stem.replace(t, "").strip()
+                stem = " ".join(stem.split())
+                candidates.append((m, prices[0], found_time[0], stem))
+    grouped = defaultdict(list)
+    for m, p, time_token, stem in candidates:
+        sig_words = set(stem.split())
+        matched = False
+        for key in list(grouped.keys()):
+            key_words = set(key.split())
+            if len(sig_words & key_words) >= 4:
+                grouped[key].append((m, p, time_token))
+                matched = True
+                break
+        if not matched:
+            grouped[stem].append((m, p, time_token))
+    for stem, group in grouped.items():
+        if len(group) < 2:
+            continue
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                m1, p1, t1 = group[i]
+                m2, p2, t2 = group[j]
+                idx1 = MONTHS.index(t1) if t1 in MONTHS else 99
+                idx2 = MONTHS.index(t2) if t2 in MONTHS else 99
+                short_p = p1 if idx1 > idx2 else p2
+                long_p  = p2 if idx1 > idx2 else p1
+                short_m = m1 if idx1 > idx2 else m2
+                long_m  = m2 if idx1 > idx2 else m1
+                if short_p > long_p:
+                    edge = round(short_p - long_p, 4)
+                    if edge >= MIN_EDGE:
+                        opps.append({
+                            "type": "Time-Series Inversion",
+                            "market": short_m.get("question","")[:60] + " | " + long_m.get("question","")[:60],
+                            "url": get_url(short_m),
+                            "url2": get_url(long_m),
+                            "prices": [round(short_p,4), round(long_p,4)],
+                            "edge": edge,
+                            "edge_pct": "{:.2f}%".format(edge * 100),
+                            "liquidity": str(short_m.get("liquidity","N/A")) + " / " + str(long_m.get("liquidity","N/A")),
+                            "threshold_used": MIN_EDGE,
+                            "urgency": "WATCH",
+                            "action": "SELL short-horizon YES + BUY long-horizon YES",
+                        })
+    return opps
+
+
+def detect_price_anchor(markets):
+    opps = []
+    for market in markets:
+        h = hours_until_expiry(market)
+        if h is None or h >= 2:
+            continue
+        prices = parse_prices(market)
+        for p in prices:
+            if 0.2 <= p <= 0.8:
+                edge = round(min(p, 1 - p), 4)
+                opps.append({
+                    "type": "🔴 URGENT Price Anchor ARB",
+                    "market": market.get("question", market.get("slug", "N/A")),
+                    "url": get_url(market),
+                    "prices": prices,
+                    "hours_left": round(h, 2),
+                    "edge": edge,
+                    "edge_pct": "{:.2f}%".format(edge * 100),
+                    "liquidity": market.get("liquidity", "N/A"),
+                    "threshold_used": 0.2,
+                    "urgency": "URGENT",
+                    "action": "CHECK RESULT NOW - price should be near 0 or 1",
+                })
+                break
+    return opps
+
+
+def detect_liquidity_spread(markets, spread_threshold):
+    opps = []
+    sampled = 0
+    for market in markets:
+        if sampled >= SPREAD_SAMPLE:
+            break
+        tokens = market.get("tokens", [])
+        if len(tokens) != 2:
+            continue
+        tid = tokens[0].get("token_id") or tokens[0].get("tokenId")
+        if not tid:
+            continue
+        sp, mid = clob_get_spread(tid)
+        sampled += 1
+        if sp is not None and sp > spread_threshold:
+            edge = round(sp / 2, 4)
+            if edge < MIN_EDGE:
+                continue
+            opps.append({
+                "type": "Liquidity Spread Opportunity",
+                "market": market.get("question", market.get("slug", "N/A")),
+                "url": get_url(market),
+                "prices": [round(mid - sp/2, 4), round(mid + sp/2, 4)],
+                "spread": round(sp, 4),
+                "midpoint": round(mid, 4),
+                "edge": edge,
+                "edge_pct": "{:.2f}%".format(edge * 100),
+                "liquidity": market.get("liquidity", "N/A"),
+                "threshold_used": round(spread_threshold, 4),
+                "urgency": "WATCH",
+                "action": "PLACE LIMIT ORDERS AT MIDPOINT " + str(round(mid, 4)),
+            })
+        time.sleep(0.1)
+    return opps
+
+
+def detect_info_arbitrage(markets):
+    opps = []
+    for market in markets:
+        h = hours_until_expiry(market)
+        if h is None or h >= 6:
+            continue
+        prices = parse_prices(market)
+        for p in prices:
+            if 0.3 <= p <= 0.7:
+                edge = round(min(p, 1 - p), 4)
+                if edge < MIN_EDGE:
+                    continue
+                urgency_key, urgency_label = get_urgency(h)
+                opps.append({
+                    "type": urgency_label + " Info ARB Candidate",
+                    "market": market.get("question", market.get("slug", "N/A")),
+                    "url": get_url(market),
+                    "prices": prices,
+                    "hours_left": round(h, 2),
+                    "edge": edge,
+                    "edge_pct": "{:.2f}%".format(edge * 100),
+                    "liquidity": market.get("liquidity", "N/A"),
+                    "threshold_used": 0.3,
+                    "urgency": urgency_key,
+                    "action": "CHECK REAL WORLD STATUS - result may be known",
+                })
+                break
+    return opps
+
+
+# ----------------------------------------------------------------
 # Output formatting
 # ----------------------------------------------------------------
 URGENCY_ORDER = {"URGENT": 0, "WATCH": 1, "EARLY": 2}
 
 
 def sort_opps(opps):
-    return sorted(opps, key=lambda o: (URGENCY_ORDER.get(o.get("urgency", "EARLY"), 2), -o.get("edge", 0)))
+    return sorted(opps, key=lambda o: (URGENCY_ORDER.get(o.get("urgency","EARLY"),2), -o.get("edge",0)))
 
 
 def fmt_opp(opp, idx):
@@ -406,50 +725,52 @@ def fmt_opp(opp, idx):
     out = "=" * 60 + "\n"
     out += "#{:02d} {}\n".format(idx, opp["type"])
     out += "Market    : " + opp["market"][:80] + "\n"
-    out += "URL       : " + opp.get("url", "N/A") + "\n"
-    out += "Liquidity : $" + str(opp.get("liquidity", "N/A")) + "\n"
-    out += "Action    : " + opp.get("action", "N/A") + "\n"
-    out += "Threshold : " + str(opp.get("threshold_used", "N/A")) + "\n"
+    if opp.get("url2"):
+        out += "URL 1     : " + opp.get("url","N/A") + "\n"
+        out += "URL 2     : " + opp.get("url2","N/A") + "\n"
+    else:
+        out += "URL       : " + opp.get("url","N/A") + "\n"
+    out += "Liquidity : $" + str(opp.get("liquidity","N/A")) + "\n"
+    out += "Action    : " + opp.get("action","N/A") + "\n"
     if "overround" in opp:
-        out += "Sum       : " + str(opp["sum"]) + "  Overround: " + opp.get("overround_pct", "N/A") + "\n"
-        out += "Prices    : " + str(price_list) + "\n"
-    elif "sum" in opp:
-        out += "Sum       : " + str(opp["sum"]) + "  Edge: " + opp.get("edge_pct", "N/A") + "\n"
-        out += "Prices    : " + str(price_list) + "\n"
+        out += "Sum       : " + str(opp["sum"]) + "  Overround: " + opp.get("overround_pct","N/A") + "\n"
+    elif "spread" in opp:
+        out += "Spread    : " + str(opp["spread"]) + "  Midpoint: " + str(opp.get("midpoint","N/A")) + "\n"
+    else:
+        out += "Edge      : " + opp.get("edge_pct","N/A") + "\n"
+    out += "Prices    : " + str(price_list) + "\n"
     if "hours_left" in opp:
         out += "Expires in: " + str(opp["hours_left"]) + "h\n"
-        out += "Suspicious: " + str(opp["suspicious"]) + "\n"
+    if "common_keywords" in opp:
+        out += "Keywords  : " + str(opp["common_keywords"]) + "\n"
     return out
 
 
-def build_tg_msg(opps, total, b_thr, m_low, m_high, e_thr):
+def build_tg_msg(opps, total, thresholds):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    urgent_count = sum(1 for o in opps if o.get("urgency") == "URGENT")
-    watch_count  = sum(1 for o in opps if o.get("urgency") == "WATCH")
-    early_count  = sum(1 for o in opps if o.get("urgency") == "EARLY")
-    sorted_opps  = sort_opps(opps)
+    urgent_n = sum(1 for o in opps if o.get("urgency") == "URGENT")
+    watch_n  = sum(1 for o in opps if o.get("urgency") == "WATCH")
+    early_n  = sum(1 for o in opps if o.get("urgency") == "EARLY")
+    sorted_opps = sort_opps(opps)
     msg = "<b>Polymarket ARB Scanner - " + str(len(opps)) + " opportunities</b>\n"
     msg += "Time: " + now_str + "\n"
     msg += "Markets scanned: " + str(total) + "\n"
-    msg += "🔴 Urgent: " + str(urgent_count) + "  🟡 Watch: " + str(watch_count) + "  🟢 Early: " + str(early_count) + "\n"
-    msg += "Thresholds: Bundle=" + str(round(b_thr,4))
-    msg += " Multi_low=" + str(round(m_low,4)) + " Multi_high=" + str(round(m_high,4))
-    msg += " Expiry=" + str(round(e_thr,4)) + "\n\n"
+    msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch: " + str(watch_n) + "  🟢 Early: " + str(early_n) + "\n"
+    msg += "Thresholds: " + thresholds + "\n\n"
     for idx, opp in enumerate(sorted_opps[:5], 1):
-        url = opp.get("url", "#")
+        url = opp.get("url","#")
         msg += "<b>#" + str(idx) + " " + opp["type"] + "</b>\n"
-        msg += opp.get("market", "N/A")[:60] + "\n"
-        msg += "Action: " + opp.get("action", "N/A") + "\n"
+        msg += opp.get("market","N/A")[:60] + "\n"
+        msg += "Action: " + opp.get("action","N/A") + "\n"
         if "overround" in opp:
             msg += "Overround: " + opp["overround_pct"] + "  Sum: " + str(opp["sum"]) + "\n"
-            msg += "Prices: " + str(opp.get("prices", [])) + "\n"
-        elif "edge_pct" in opp:
-            msg += "Edge: " + opp["edge_pct"] + "\n"
-            if "sum" in opp:
-                pl = opp.get("prices") or opp.get("prices_clob", [])
-                msg += "Prices: " + str(pl) + " sum=" + str(opp["sum"]) + "\n"
+        elif "spread" in opp:
+            msg += "Spread: " + str(opp["spread"]) + "  Mid: " + str(opp.get("midpoint","")) + "\n"
+        else:
+            msg += "Edge: " + opp.get("edge_pct","N/A") + "\n"
+        msg += "Prices: " + str(opp.get("prices") or opp.get("prices_clob",[])) + "\n"
         if "hours_left" in opp:
-            msg += "Expires in: " + str(opp["hours_left"]) + "h\n"
+            msg += "Expires: " + str(opp["hours_left"]) + "h\n"
         msg += '<a href="' + url + '">View Market</a>\n\n'
     return msg
 
@@ -459,45 +780,38 @@ def build_tg_msg(opps, total, b_thr, m_low, m_high, e_thr):
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner (dynamic thresholds, 7-day window)")
+    log.info("Polymarket ARB Scanner v3 - All 10 detectors + MIN_EDGE=" + str(MIN_EDGE))
     log.info("Time: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
-    log.info("Expiry window: " + str(EXPIRY_WINDOW) + "h | STD multiplier: " + str(STD_MULTIPLIER))
     log.info("=" * 60)
 
     markets = fetch_all_markets()
     if not markets:
         log.error("No markets fetched")
-        send_telegram("ERROR: Could not fetch Polymarket markets")
+        send_telegram("ERROR: Could not fetch markets")
         return
 
-    log.info("Computing dynamic thresholds from " + str(len(markets)) + " markets...")
-    b_thr, m_low, m_high, e_thr = analyze_markets(markets)
+    log.info("Computing dynamic thresholds...")
+    b_thr, m_low, m_high, e_thr, sp_thr = analyze_markets(markets)
 
     opps = []
     bundle_candidates = []
 
+    log.info("Scanning " + str(len(markets)) + " markets...")
     for i, market in enumerate(markets):
         if i % 500 == 0 and i > 0:
             log.info("progress: {}/{}".format(i, len(markets)))
-
         r = detect_bundle(market, b_thr)
         if r:
             bundle_candidates.append((market, r))
-
         r = detect_multi_under(market, m_low)
         if r:
             opps.append(r)
-
         r = detect_multi_over(market, m_high)
         if r:
             opps.append(r)
-
         r = detect_near_expiry(market, e_thr)
         if r:
             opps.append(r)
-
-    log.info("bundle candidates : " + str(len(bundle_candidates)))
-    log.info("other opps so far : " + str(len(opps)))
 
     log.info("CLOB confirming " + str(len(bundle_candidates)) + " bundle candidates...")
     for market, prelim in bundle_candidates:
@@ -505,57 +819,83 @@ def scan():
         opps.append(confirmed if confirmed else prelim)
         time.sleep(REQUEST_DELAY)
 
-    opps = sort_opps(opps)
+    log.info("Running cross-market detectors...")
+    opps += detect_cross_market(markets, b_thr, m_high)
+    opps += detect_parent_child(markets)
+    opps += detect_time_series(markets)
+    opps += detect_price_anchor(markets)
+    opps += detect_liquidity_spread(markets, sp_thr)
+    opps += detect_info_arbitrage(markets)
 
-    urgent_n = sum(1 for o in opps if o.get("urgency") == "URGENT")
-    watch_n  = sum(1 for o in opps if o.get("urgency") == "WATCH")
-    early_n  = sum(1 for o in opps if o.get("urgency") == "EARLY")
-    under_n  = sum(1 for o in opps if "UNDER" in o.get("type", ""))
-    over_n   = sum(1 for o in opps if "OVER" in o.get("type", ""))
+    seen = set()
+    unique_opps = []
+    for o in opps:
+        key = o.get("type","") + "|" + o.get("url","")
+        if key not in seen:
+            seen.add(key)
+            unique_opps.append(o)
+    opps = sort_opps(unique_opps)
+
+    urgent_n  = sum(1 for o in opps if o.get("urgency") == "URGENT")
+    watch_n   = sum(1 for o in opps if o.get("urgency") == "WATCH")
+    early_n   = sum(1 for o in opps if o.get("urgency") == "EARLY")
+    anchor_n  = sum(1 for o in opps if "Anchor" in o.get("type",""))
+    info_n    = sum(1 for o in opps if "Info ARB" in o.get("type",""))
+    cross_n   = sum(1 for o in opps if "Cross-Market" in o.get("type",""))
+    parent_n  = sum(1 for o in opps if "Parent-Child" in o.get("type",""))
+    ts_n      = sum(1 for o in opps if "Time-Series" in o.get("type",""))
+    spread_n  = sum(1 for o in opps if "Spread" in o.get("type",""))
+    under_n   = sum(1 for o in opps if "UNDER" in o.get("type",""))
+    over_n    = sum(1 for o in opps if "OVER" in o.get("type",""))
 
     log.info("=" * 60)
-    log.info("DONE - " + str(len(opps)) + " opportunities total")
-    log.info("  🔴 URGENT      : " + str(urgent_n))
-    log.info("  🟡 WATCH       : " + str(watch_n))
-    log.info("  🟢 EARLY       : " + str(early_n))
-    log.info("  📉 Multi UNDER : " + str(under_n))
-    log.info("  📈 Multi OVER  : " + str(over_n))
+    log.info("DONE - " + str(len(opps)) + " opportunities (MIN_EDGE=" + str(MIN_EDGE) + ")")
+    log.info("  🔴 URGENT       : " + str(urgent_n))
+    log.info("  🟡 WATCH        : " + str(watch_n))
+    log.info("  🟢 EARLY        : " + str(early_n))
+    log.info("  💡 Price Anchor : " + str(anchor_n))
+    log.info("  🔍 Info ARB     : " + str(info_n))
+    log.info("  🔄 Cross-Market : " + str(cross_n))
+    log.info("  🧩 Parent-Child : " + str(parent_n))
+    log.info("  ⏰ Time-Series  : " + str(ts_n))
+    log.info("  📊 Liq Spread   : " + str(spread_n))
+    log.info("  📉 Multi UNDER  : " + str(under_n))
+    log.info("  📈 Multi OVER   : " + str(over_n))
     log.info("=" * 60)
 
+    thr_str = "B=" + str(round(b_thr,4)) + " ML=" + str(round(m_low,4)) + " MH=" + str(round(m_high,4)) + " E=" + str(round(e_thr,4))
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     if not opps:
         log.info("No opportunities this round")
         send_telegram(
             "<b>Polymarket ARB Scanner</b>\n"
             + "Time: " + now_str + "\n"
             + "Markets scanned: " + str(len(markets)) + "\n"
-            + "Bundle threshold  : " + str(round(b_thr,4)) + "\n"
-            + "Multi lower       : " + str(round(m_low,4)) + "\n"
-            + "Multi upper       : " + str(round(m_high,4)) + "\n"
-            + "Expiry threshold  : " + str(round(e_thr,4)) + "\n"
-            + "Result: No opportunities found"
+            + "Thresholds: " + thr_str + "\n"
+            + "Result: No opportunities found (MIN_EDGE=" + str(MIN_EDGE) + ")"
         )
     else:
         for idx, opp in enumerate(opps, 1):
             print(fmt_opp(opp, idx))
-        send_telegram(build_tg_msg(opps, len(markets), b_thr, m_low, m_high, e_thr))
+        send_telegram(build_tg_msg(opps, len(markets), thr_str))
 
     report = {
         "scan_time": datetime.now(timezone.utc).isoformat(),
         "total_markets_scanned": len(markets),
+        "min_edge_filter": MIN_EDGE,
         "dynamic_thresholds": {
-            "bundle":      round(b_thr, 4),
-            "multi_lower": round(m_low, 4),
-            "multi_upper": round(m_high, 4),
-            "near_expiry": round(e_thr, 4),
+            "bundle":      round(b_thr,4),
+            "multi_lower": round(m_low,4),
+            "multi_upper": round(m_high,4),
+            "near_expiry": round(e_thr,4),
+            "spread":      round(sp_thr,4),
         },
         "opportunities_summary": {
-            "total":       len(opps),
-            "urgent":      urgent_n,
-            "watch":       watch_n,
-            "early":       early_n,
-            "multi_under": under_n,
-            "multi_over":  over_n,
+            "total": len(opps), "urgent": urgent_n, "watch": watch_n, "early": early_n,
+            "price_anchor": anchor_n, "info_arb": info_n, "cross_market": cross_n,
+            "parent_child": parent_n, "time_series": ts_n, "liq_spread": spread_n,
+            "multi_under": under_n, "multi_over": over_n,
         },
         "opportunities": opps,
     }
