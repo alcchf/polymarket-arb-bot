@@ -1,4 +1,4 @@
-import requests,os,math,re
+import requests,os
 
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
@@ -13,32 +13,40 @@ def send(msg):
     except: pass
 
 # =========================
-# ✅ Verified Market Fetch
+# ✅ Deep Pagination Market Fetch
 # =========================
 def markets():
-    try:
-        r=requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"active":"true","limit":300},
-            headers={
-                "User-Agent":"Mozilla/5.0"
-            },
-            timeout=10
-        )
 
-        if r.status_code!=200:
-            send(f"❌ API error: {r.status_code}")
-            return []
+    all=[]
 
-        data=r.json()
+    for i in range(0,2400,300):
 
-        send(f"📊 Markets fetched: {len(data)}")
+        try:
+            r=requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={
+                    "active":"true",
+                    "limit":300,
+                    "offset":i
+                },
+                headers={"User-Agent":"Mozilla/5.0"},
+                timeout=10
+            )
 
-        return data
+            if r.status_code==200:
+                data=r.json()
 
-    except Exception as e:
-        send(f"❌ Market fetch failed:\n{e}")
-        return []
+                if len(data)==0:
+                    break
+
+                all+=data
+
+        except:
+            continue
+
+    send(f"📊 Markets fetched: {len(all)}")
+
+    return all
 
 # =========================
 # Mutual Outcome Arb
@@ -87,7 +95,6 @@ SELL all YES
 🔗 https://polymarket.com/event/{slug}
 """)
                         found=True
-
     return found
 
 # =========================
@@ -131,7 +138,49 @@ SELL Presidency YES
 🔗 https://polymarket.com/event/{slug}
 """)
                     found=True
+    return found
 
+# =========================
+# Release Arb
+# =========================
+def release(ms):
+
+    rel=[];ann=[]
+    found=False
+
+    for m in ms:
+
+        q=m.get("question","").lower()
+
+        try:
+            p=float(m["outcomes"][0]["price"])
+            liq=float(m["liquidity"])
+        except:continue
+
+        if liq<20000:continue
+
+        if "release" in q: rel.append((m,p))
+        if "announce" in q: ann.append((m,p))
+
+    for r in rel:
+        for a in ann:
+
+            if any(w in r[0]["question"].lower() for w in a[0]["question"].lower().split()):
+
+                if r[1]>a[1]+0.03:
+
+                    slug=a[0].get("slug")
+                    if not slug:continue
+
+                    send(f"""
+⚠️ Release vs Announce Arb
+
+BUY Announce YES
+SELL Release YES
+
+🔗 https://polymarket.com/event/{slug}
+""")
+                    found=True
     return found
 
 # =========================
@@ -153,7 +202,7 @@ def bucket(ms):
 
         if liq<20000:continue
 
-        if any(k in q for k in ["cpi","rate","inflation"]):
+        if any(k in q for k in ["cpi","rate","inflation","unemployment"]):
             if "%" in q or "-" in q:
                 b.append((m,p))
 
@@ -176,7 +225,6 @@ SELL all YES
 🔗 https://polymarket.com/event/{slug}
 """)
                     found=True
-
     return found
 
 # =========================
@@ -186,7 +234,8 @@ ms=markets()
 
 m1=mutual(ms)
 m2=nomination(ms)
-m3=bucket(ms)
+m3=release(ms)
+m4=bucket(ms)
 
-if not m1 and not m2 and not m3:
+if not m1 and not m2 and not m3 and not m4:
     send("✅ Hybrid scan complete - No Arb Found")
