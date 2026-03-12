@@ -6,6 +6,8 @@ from collections import defaultdict
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+
 # =========================
 # Telegram
 # =========================
@@ -14,62 +16,72 @@ def send(msg):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(
             url,
-            json={"chat_id": CHAT_ID, "text": msg},
+            json={"chat_id": CHAT_ID, "text": msg[:4000]},
             timeout=5
         )
     except Exception as e:
-        print(f"[WARN] Telegram failed: {e}")
+        print(f"[WARN] Telegram: {e}")
 
 # =========================
-# YES Price Parser
+# YES price from outcomePrices string
+# outcomePrices = "0.23,0.77" → YES = 0.23
 # =========================
-def get_yes_price(m):
+def parse_yes_price(market):
     try:
-        # Format A: outcomes = list of dicts
-        outcomes = m.get("outcomes")
-        if isinstance(outcomes, list):
-            for o in outcomes:
-                if isinstance(o, dict):
-                    if str(o.get("name","")).strip().lower() == "yes":
-                        return float(o.get("price", 0))
-
-        # Format B: outcomes = "Yes,No", outcomePrices = "0.3,0.7"
-        if isinstance(outcomes, str):
-            names = [x.strip() for x in outcomes.split(",")]
-            prices_raw = str(m.get("outcomePrices", ""))
-            prices = [x.strip() for x in prices_raw.split(",")]
-            if len(names) == len(prices):
-                for i, name in enumerate(names):
-                    if name.lower() == "yes":
-                        return float(prices[i])
-
+        op = market.get("outcomePrices")
+        if op and isinstance(op, str):
+            parts = [x.strip() for x in op.split(",")]
+            if len(parts) >= 1:
+                return float(parts[0])
     except Exception as e:
-        print(f"[WARN] get_yes_price: {e}")
-
+        print(f"[WARN] parse_yes_price: {e}")
     return None
 
 # =========================
-# ✅ Event ID（正确分组Key）
+# Fetch Events (correct endpoint for Partition Arb)
+# Each Event contains multiple Markets = Partition
 # =========================
-def get_event_id(m):
-    try:
-        events = m.get("events", [])
-        if isinstance(events, list) and len(events) > 0:
-            e = events[0]
-            if isinstance(e, dict):
-                return str(e.get("id", ""))
-    except Exception:
-        pass
+def fetch_events():
+    all_events = []
 
-    # fallback: groupItemTitle
-    g = m.get("groupItemTitle")
-    if g:
-        return f"g:{g}"
+    for offset in range(0, 1200, 100):
+        try:
+            r = requests.get(
+                f"{GAMMA_BASE}/events",
+                params={
+                    "active": "true",
+                    "limit": 100,
+                    "offset": offset
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10
+            )
 
-    return None
+            if r.status_code != 200:
+                print(f"[WARN] events offset={offset} status={r.status_code}")
+                continue
+
+            data = r.json()
+
+            if not isinstance(data, list):
+                print(f"[WARN] events unexpected type at offset={offset}")
+                continue
+
+            if len(data) == 0:
+                print(f"[INFO] events empty at offset={offset}, stopping")
+                break
+
+            all_events.extend(data)
+            print(f"[INFO] events offset={offset} page={len(data)} total={len(all_events)}")
+
+        except Exception as e:
+            print(f"[WARN] events offset={offset}: {e}")
+            continue
+
+    return all_events
 
 # =========================
-# Deep Pagination
+# Fetch Markets (for Mutual + Nomination)
 # =========================
 def fetch_markets():
     all_markets = []
@@ -77,7 +89,7 @@ def fetch_markets():
     for offset in range(0, 2400, 300):
         try:
             r = requests.get(
-                "https://gamma-api.polymarket.com/markets",
+                f"{GAMMA_BASE}/markets",
                 params={
                     "active": "true",
                     "limit": 300,
@@ -88,78 +100,71 @@ def fetch_markets():
             )
 
             if r.status_code != 200:
-                print(f"[WARN] offset={offset} status={r.status_code}")
+                print(f"[WARN] markets offset={offset} status={r.status_code}")
                 continue
 
             data = r.json()
 
-            if not isinstance(data, list):
-                print(f"[WARN] unexpected type at offset={offset}")
-                continue
-
-            if len(data) == 0:
-                print(f"[INFO] empty page at offset={offset}, stopping")
+            if not isinstance(data, list) or len(data) == 0:
                 break
 
             all_markets.extend(data)
-            print(f"[INFO] offset={offset} page={len(data)} total={len(all_markets)}")
+            print(f"[INFO] markets offset={offset} page={len(data)} total={len(all_markets)}")
 
         except Exception as e:
-            print(f"[WARN] offset={offset} error: {e}")
+            print(f"[WARN] markets offset={offset}: {e}")
             continue
 
     return all_markets
 
 # =========================
-# ⭐ Partition Arb
-# 用 events[0]["id"] 分组（官方文档正确做法）
+# ⭐ Partition Arb (via /events endpoint)
+# Each Event's markets form a natural Partition
 # =========================
-def partition_arb(markets):
+def partition_arb(events):
     found = False
-    groups = defaultdict(list)
-
-    for m in markets:
-
-        event_id = get_event_id(m)
-        if not event_id:
-            continue
-
-        try:
-            liq = float(m.get("liquidity", 0))
-        except Exception:
-            continue
-
-        if liq < 300:
-            continue
-
-        yes_price = get_yes_price(m)
-        if yes_price is None:
-            continue
-
-        groups[event_id].append({
-            "question": m.get("question", ""),
-            "yes": yes_price,
-            "slug": m.get("slug", ""),
-            "liq": liq,
-        })
-
-    print(f"[INFO] partition groups found: {len(groups)}")
-
     arb_count = 0
 
-    for event_id, buckets in groups.items():
+    for event in events:
+        event_title = event.get("title", "") or event.get("slug", "")
+        markets = event.get("markets", [])
+
+        if not isinstance(markets, list):
+            continue
+
+        if len(markets) < 3:
+            continue
+
+        buckets = []
+
+        for m in markets:
+            try:
+                liq = float(m.get("liquidity", 0))
+            except Exception:
+                continue
+
+            yes_price = parse_yes_price(m)
+
+            if yes_price is None:
+                continue
+
+            buckets.append({
+                "question": m.get("question", ""),
+                "yes": yes_price,
+                "slug": m.get("slug", ""),
+                "liq": liq,
+            })
 
         if len(buckets) < 3:
             continue
 
         sum_yes = sum(b["yes"] for b in buckets)
 
-        print(f"[DEBUG] event={event_id} buckets={len(buckets)} sum_yes={round(sum_yes,4)}")
+        print(f"[DEBUG] event='{event_title[:50]}' buckets={len(buckets)} sum_yes={round(sum_yes,4)}")
 
         slug = buckets[0].get("slug", "")
         url = f"https://polymarket.com/event/{slug}" if slug else ""
 
-        # ⭐ Overround: SELL YES / BUY NO
         if sum_yes > 1.03:
             found = True
             arb_count += 1
@@ -169,20 +174,19 @@ def partition_arb(markets):
                 "🚨🚨🚨 EXECUTE NOW 🚨🚨🚨",
                 "",
                 "Partition Arb → BUY ALL NO",
-                f"Σ YES = {round(sum_yes,4)}",
+                f"Event: {event_title[:60]}",
+                f"Σ YES = {round(sum_yes, 4)}",
                 f"Profit ≈ {profit}",
                 "",
                 "Buckets:"
             ]
             for b in sorted(buckets, key=lambda x: x["yes"], reverse=True)[:8]:
                 lines.append(f"  {round(b['yes'],3)}  {b['question'][:50]}")
-
             if url:
                 lines.append(f"\n🔗 {url}")
 
             send("\n".join(lines))
 
-        # ⭐ Underround: BUY YES
         elif sum_yes < 0.97:
             found = True
             arb_count += 1
@@ -192,14 +196,14 @@ def partition_arb(markets):
                 "🚨🚨🚨 EXECUTE NOW 🚨🚨🚨",
                 "",
                 "Partition Arb → BUY ALL YES",
-                f"Σ YES = {round(sum_yes,4)}",
+                f"Event: {event_title[:60]}",
+                f"Σ YES = {round(sum_yes, 4)}",
                 f"Profit ≈ {profit}",
                 "",
                 "Buckets:"
             ]
             for b in sorted(buckets, key=lambda x: x["yes"], reverse=True)[:8]:
                 lines.append(f"  {round(b['yes'],3)}  {b['question'][:50]}")
-
             if url:
                 lines.append(f"\n🔗 {url}")
 
@@ -216,9 +220,8 @@ def mutual_arb(markets):
     groups = defaultdict(list)
 
     for m in markets:
-
-        event_id = get_event_id(m)
-        if not event_id:
+        g = m.get("groupItemTitle")
+        if not g:
             continue
 
         try:
@@ -229,18 +232,17 @@ def mutual_arb(markets):
         if liq < 5000:
             continue
 
-        yes_price = get_yes_price(m)
+        yes_price = parse_yes_price(m)
         if yes_price is None:
             continue
 
-        groups[event_id].append({
+        groups[g].append({
             "question": m.get("question", ""),
             "yes": yes_price,
             "slug": m.get("slug", ""),
         })
 
-    for event_id, items in groups.items():
-
+    for g, items in groups.items():
         if len(items) < 3:
             continue
 
@@ -260,7 +262,6 @@ def mutual_arb(markets):
             ]
             for i in items[:6]:
                 lines.append(f"  {round(i['yes'],3)}  {i['question'][:50]}")
-
             if url:
                 lines.append(f"\n🔗 {url}")
 
@@ -279,7 +280,7 @@ def nomination_arb(markets):
     stop_words = {
         "the","a","in","of","will","who","win","be",
         "is","to","for","at","on","by","can","get",
-        "has","have","had","was","were"
+        "has","have","had","was","were","and","or"
     }
 
     for m in markets:
@@ -293,13 +294,12 @@ def nomination_arb(markets):
         if liq < 5000:
             continue
 
-        yes_price = get_yes_price(m)
+        yes_price = parse_yes_price(m)
         if yes_price is None:
             continue
 
         if "president" in q:
             pres.append((m, yes_price))
-
         if "nomination" in q or "primary" in q:
             nom.append((m, yes_price))
 
@@ -345,10 +345,15 @@ def main():
     ts = int(time.time())
     print(f"[START] ts={ts}")
 
+    # ⭐ Events for Partition Arb
+    events = fetch_events()
+    print(f"[INFO] total events: {len(events)}")
+
+    # Markets for Mutual + Nomination
     markets = fetch_markets()
     print(f"[INFO] total markets: {len(markets)}")
 
-    p = partition_arb(markets)
+    p = partition_arb(events)
     m1 = mutual_arb(markets)
     m2 = nomination_arb(markets)
 
