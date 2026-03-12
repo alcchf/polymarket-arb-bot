@@ -6,9 +6,23 @@ from collections import defaultdict
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GAMMA_BASE = "https://gamma-api.polymarket.com"
 
-def send(msg):
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+USER_AGENT = "Mozilla/5.0 (compatible; PolymarketReadOnlyVerifier/1.0)"
+PAGE_SIZE = 300
+MAX_OFFSET = 2400
+TIMEOUT = 10
+
+
+# =========================
+# Telegram
+# =========================
+def send(msg: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[WARN] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+        print(msg)
+        return
+
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(
@@ -17,261 +31,309 @@ def send(msg):
             timeout=5
         )
     except Exception as e:
-        print(f"[WARN] Telegram: {e}")
+        print(f"[WARN] Telegram send failed: {e}")
+        print(msg)
 
-# ✅ YES Price Parser
-# outcomePrices = '["0.27","0.73"]' → YES = prices[0]
-def parse_yes_price(market):
-    try:
-        op = market.get("outcomePrices")
-        if op and isinstance(op, str):
-            prices = json.loads(op)
-            if isinstance(prices, list) and len(prices) >= 1:
-                return float(prices[0])
-    except Exception as e:
-        print(f"[WARN] parse_yes_price: {e}")
-    return None
-
-# ✅ Fetch Markets (single source of truth)
-def fetch_markets():
-    all_markets = []
-    for offset in range(0, 2400, 300):
-        try:
-            r = requests.get(
-                f"{GAMMA_BASE}/markets",
-                params={
-                    "active": "true",
-                    "limit": 300,
-                    "offset": offset
-                },
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10
-            )
-            if r.status_code != 200:
-                print(f"[WARN] markets offset={offset} status={r.status_code}")
-                continue
-            data = r.json()
-            if not isinstance(data, list) or len(data) == 0:
-                print(f"[INFO] markets empty at offset={offset}")
-                break
-            all_markets.extend(data)
-            print(f"[INFO] markets offset={offset} page={len(data)} total={len(all_markets)}")
-        except Exception as e:
-            print(f"[WARN] markets offset={offset}: {e}")
-    return all_markets
-
-# ✅ Partition Arb
-# 用 groupItemTitle 分组（/markets 里最可靠的字段）
-# 同时验证 endDate 相同（确保是同一个 Event 的 Buckets）
-def partition_arb(markets):
-    found = False
-    groups = defaultdict(list)
-
-    for m in markets:
-        g = m.get("groupItemTitle")
-        if not g:
-            continue
-
-        # 必须有结束日期（用来验证是同一 Event）
-        end = m.get("endDate") or m.get("end") or ""
-
-        # 用 groupItemTitle + endDate 作为复合 key
-        # 这样确保只有同一事件同一时间的 Buckets 被分在一组
-        key = f"{g}||{end}"
-
-        try:
-            liq = float(m.get("liquidity", 0))
-        except Exception:
-            liq = 0
-
-        # Partition Arb 不需要高流动性
-        # 只要有流动性就可以
-        if liq < 100:
-            continue
-
-        yes = parse_yes_price(m)
-        if yes is None:
-            continue
-
-        groups[key].append({
-            "question": m.get("question", ""),
-            "yes": yes,
-            "slug": m.get("slug", ""),
-            "liq": liq,
-            "group": g,
-        })
-
-    print(f"[INFO] partition groups: {len(groups)}")
-
-    arb_count = 0
-
-    for key, buckets in groups.items():
-
-        if len(buckets) < 3:
-            continue
-
-        sum_yes = sum(b["yes"] for b in buckets)
-        group_name = buckets[0].get("group", "")
-
-        print(f"[DEBUG] '{group_name[:50]}' n={len(buckets)} Σ={round(sum_yes,4)}")
-
-        slug = buckets[0].get("slug", "")
-        url = f"https://polymarket.com/event/{slug}" if slug else ""
-
-        if sum_yes > 1.03:
-            arb_count += 1
-            found = True
-            lines = [
-                "🚨🚨🚨 EXECUTE NOW 🚨🚨🚨",
-                "Partition Arb → BUY ALL NO",
-                f"Group: {group_name[:60]}",
-                f"Σ YES = {round(sum_yes,4)}",
-                f"Profit ≈ {round(sum_yes-1,4)}",
-                f"Buckets ({len(buckets)}):"
-            ]
-            for b in sorted(buckets, key=lambda x: x["yes"], reverse=True)[:8]:
-                lines.append(f"  {round(b['yes'],3)}  {b['question'][:50]}")
-            if url:
-                lines.append(f"\n🔗 {url}")
-            send("\n".join(lines))
-
-        elif sum_yes < 0.97:
-            arb_count += 1
-            found = True
-            lines = [
-                "🚨🚨🚨 EXECUTE NOW 🚨🚨🚨",
-                "Partition Arb → BUY ALL YES",
-                f"Group: {group_name[:60]}",
-                f"Σ YES = {round(sum_yes,4)}",
-                f"Profit ≈ {round(1-sum_yes,4)}",
-                f"Buckets ({len(buckets)}):"
-            ]
-            for b in sorted(buckets, key=lambda x: x["yes"], reverse=True)[:8]:
-                lines.append(f"  {round(b['yes'],3)}  {b['question'][:50]}")
-            if url:
-                lines.append(f"\n🔗 {url}")
-            send("\n".join(lines))
-
-    print(f"[INFO] partition arb count: {arb_count}")
-    return found
-
-# ✅ Mutual Outcome Arb
-def mutual_arb(markets):
-    found = False
-    groups = defaultdict(list)
-
-    for m in markets:
-        g = m.get("groupItemTitle")
-        if not g:
-            continue
-        try:
-            liq = float(m.get("liquidity", 0))
-        except Exception:
-            continue
-        if liq < 5000:
-            continue
-        yes = parse_yes_price(m)
-        if yes is None:
-            continue
-        groups[g].append({
-            "question": m.get("question", ""),
-            "yes": yes,
-            "slug": m.get("slug", ""),
-        })
-
-    for g, items in groups.items():
-        if len(items) < 3:
-            continue
-        s = sum(i["yes"] for i in items)
-        if s > 1.05:
-            found = True
-            slug = items[0].get("slug", "")
-            url = f"https://polymarket.com/event/{slug}" if slug else ""
-            lines = [
-                "⚠️ Mutual Outcome Arb",
-                f"Σ YES = {round(s,4)}",
-                f"Gap = {round(s-1,4)}",
-                "SELL all YES", ""
-            ]
-            for i in items[:6]:
-                lines.append(f"  {round(i['yes'],3)}  {i['question'][:50]}")
-            if url:
-                lines.append(f"\n🔗 {url}")
-            send("\n".join(lines))
-
-    return found
-
-# ✅ Nomination Arb
-def nomination_arb(markets):
-    found = False
-    pres = []
-    nom = []
-
-    stop = {
-        "the","a","in","of","will","who","win","be",
-        "is","to","for","at","on","by","can","get",
-        "has","have","had","was","were","and","or"
-    }
-
-    for m in markets:
-        q = m.get("question", "").lower()
-        try:
-            liq = float(m.get("liquidity", 0))
-        except Exception:
-            continue
-        if liq < 5000:
-            continue
-        yes = parse_yes_price(m)
-        if yes is None:
-            continue
-        if "president" in q:
-            pres.append((m, yes))
-        if "nomination" in q or "primary" in q:
-            nom.append((m, yes))
-
-    for p_m, p_price in pres:
-        for n_m, n_price in nom:
-            pq = p_m.get("question", "").lower()
-            nq = n_m.get("question", "").lower()
-            p_words = {w for w in pq.split() if len(w) > 2 and w not in stop}
-            n_words = {w for w in nq.split() if len(w) > 2 and w not in stop}
-            if len(p_words & n_words) < 2:
-                continue
-            gap = p_price - n_price
-            if gap > 0.05:
-                found = True
-                slug = n_m.get("slug", "")
-                url = f"https://polymarket.com/event/{slug}" if slug else ""
-                send(
-                    f"🚨 EXECUTE NOW\n\n"
-                    f"Nomination Arb\nGap={round(gap,3)}\n\n"
-                    f"Presidency: {p_m.get('question','')[:60]}\n"
-                    f"YES={round(p_price,3)}\n\n"
-                    f"Nomination: {n_m.get('question','')[:60]}\n"
-                    f"YES={round(n_price,3)}\n\n"
-                    f"BUY Nomination YES\nSELL Presidency YES\n\n"
-                    f"🔗 {url}"
-                )
-
-    return found
 
 # =========================
-# Run
+# Robust GET
+# =========================
+def safe_get(url, params=None):
+    try:
+        r = requests.get(
+            url,
+            params=params or {},
+            headers={"User-Agent": USER_AGENT},
+            timeout=TIMEOUT
+        )
+        return r.status_code, r.text
+    except Exception as e:
+        return None, str(e)
+
+
+# =========================
+# Fetch markets with deep pagination
+# =========================
+def fetch_markets():
+    raw = []
+    page_reports = []
+
+    for offset in range(0, MAX_OFFSET, PAGE_SIZE):
+        status, text = safe_get(
+            f"{GAMMA_BASE}/markets",
+            params={
+                "active": "true",
+                "limit": PAGE_SIZE,
+                "offset": offset
+            }
+        )
+
+        if status != 200:
+            page_reports.append({
+                "offset": offset,
+                "status": status,
+                "count": 0,
+                "ok": False,
+                "error": text[:200]
+            })
+            continue
+
+        try:
+            data = json.loads(text)
+        except Exception as e:
+            page_reports.append({
+                "offset": offset,
+                "status": status,
+                "count": 0,
+                "ok": False,
+                "error": f"JSON parse error: {e}"
+            })
+            continue
+
+        if not isinstance(data, list):
+            page_reports.append({
+                "offset": offset,
+                "status": status,
+                "count": 0,
+                "ok": False,
+                "error": f"Unexpected type: {type(data).__name__}"
+            })
+            continue
+
+        if len(data) == 0:
+            page_reports.append({
+                "offset": offset,
+                "status": status,
+                "count": 0,
+                "ok": True,
+                "error": None
+            })
+            break
+
+        raw.extend(data)
+        page_reports.append({
+            "offset": offset,
+            "status": status,
+            "count": len(data),
+            "ok": True,
+            "error": None
+        })
+
+    return raw, page_reports
+
+
+# =========================
+# Parse YES price safely
+# Handles:
+# 1) outcomePrices = '["0.27","0.73"]'
+# 2) outcomes list of dicts
+# 3) outcomes string + outcomePrices string
+# =========================
+def parse_yes_price(m):
+    # Case A: outcomePrices JSON string
+    try:
+        op = m.get("outcomePrices")
+        if isinstance(op, str) and op.strip():
+            parsed = json.loads(op)
+            if isinstance(parsed, list) and len(parsed) >= 1:
+                return float(parsed[0]), "outcomePrices_json"
+    except Exception:
+        pass
+
+    # Case B: outcomes = list[dict]
+    try:
+        outcomes = m.get("outcomes")
+        if isinstance(outcomes, list):
+            for o in outcomes:
+                if isinstance(o, dict):
+                    name = str(o.get("name", "")).strip().lower()
+                    if name == "yes":
+                        return float(o.get("price", 0)), "outcomes_list_dict"
+    except Exception:
+        pass
+
+    # Case C: outcomes = "Yes,No" + outcomePrices = "0.27,0.73"
+    try:
+        outcomes = m.get("outcomes")
+        op = m.get("outcomePrices")
+        if isinstance(outcomes, str) and isinstance(op, str):
+            names = [x.strip() for x in outcomes.split(",")]
+            prices = [x.strip() for x in op.split(",")]
+            if len(names) == len(prices):
+                for i, name in enumerate(names):
+                    if name.lower() == "yes":
+                        return float(prices[i]), "outcomes_string"
+    except Exception:
+        pass
+
+    return None, None
+
+
+# =========================
+# Diagnostics
+# =========================
+def build_diagnostics(markets):
+    diag = {
+        "total": len(markets),
+        "unique_ids": 0,
+        "with_slug": 0,
+        "with_group": 0,
+        "with_condition": 0,
+        "with_events": 0,
+        "yes_price_ok": 0,
+        "yes_price_fail": 0,
+        "yes_price_by_mode": defaultdict(int),
+        "temperature_like": 0,
+        "top_groups": [],
+        "sample_markets": [],
+    }
+
+    ids = set()
+    groups = defaultdict(int)
+
+    for m in markets:
+        mid = m.get("id")
+        if mid:
+            ids.add(str(mid))
+
+        if m.get("slug"):
+            diag["with_slug"] += 1
+
+        if m.get("groupItemTitle"):
+            diag["with_group"] += 1
+            groups[str(m["groupItemTitle"])] += 1
+
+        if m.get("conditionId"):
+            diag["with_condition"] += 1
+
+        if m.get("events"):
+            diag["with_events"] += 1
+
+        yes_price, mode = parse_yes_price(m)
+        if yes_price is not None:
+            diag["yes_price_ok"] += 1
+            diag["yes_price_by_mode"][mode] += 1
+        else:
+            diag["yes_price_fail"] += 1
+
+        q = str(m.get("question", "")).lower()
+        g = str(m.get("groupItemTitle", "")).lower()
+
+        if any(k in q or k in g for k in [
+            "temperature", "temp", "highest temperature", "°c", "°f", "fahrenheit", "celsius"
+        ]):
+            diag["temperature_like"] += 1
+
+        if len(diag["sample_markets"]) < 10:
+            diag["sample_markets"].append({
+                "question": m.get("question", ""),
+                "groupItemTitle": m.get("groupItemTitle"),
+                "slug": m.get("slug"),
+                "conditionId": m.get("conditionId"),
+                "events_type": type(m.get("events")).__name__,
+                "outcomes_type": type(m.get("outcomes")).__name__,
+                "outcomePrices_type": type(m.get("outcomePrices")).__name__,
+            })
+
+    diag["unique_ids"] = len(ids)
+    diag["top_groups"] = sorted(groups.items(), key=lambda x: x[1], reverse=True)[:10]
+    diag["yes_price_by_mode"] = dict(diag["yes_price_by_mode"])
+
+    return diag
+
+
+# =========================
+# Temperature-like market dump
+# =========================
+def collect_temperature_examples(markets, limit=10):
+    out = []
+
+    for m in markets:
+        q = str(m.get("question", "")).lower()
+        g = str(m.get("groupItemTitle", "")).lower()
+
+        if any(k in q or k in g for k in [
+            "temperature", "temp", "highest temperature", "°c", "°f", "fahrenheit", "celsius"
+        ]):
+            yes_price, mode = parse_yes_price(m)
+
+            out.append({
+                "question": m.get("question", ""),
+                "groupItemTitle": m.get("groupItemTitle"),
+                "slug": m.get("slug"),
+                "conditionId": m.get("conditionId"),
+                "yes_price": yes_price,
+                "yes_mode": mode,
+                "outcomes_raw_type": type(m.get("outcomes")).__name__,
+                "outcomePrices_raw_type": type(m.get("outcomePrices")).__name__,
+            })
+
+            if len(out) >= limit:
+                break
+
+    return out
+
+
+# =========================
+# Main
 # =========================
 def main():
     ts = int(time.time())
-    print(f"[START] ts={ts}")
 
-    markets = fetch_markets()
-    print(f"[INFO] total markets: {len(markets)}")
+    raw, pages = fetch_markets()
 
-    p = partition_arb(markets)
-    m1 = mutual_arb(markets)
-    m2 = nomination_arb(markets)
+    # de-dup by id
+    uniq = {}
+    for m in raw:
+        mid = m.get("id")
+        if mid:
+            uniq[str(mid)] = m
+    markets = list(uniq.values())
 
-    if not p and not m1 and not m2:
-        send(f"✅ No Arb Found @ {ts}")
-    else:
-        send(f"✅ Scan complete @ {ts}")
+    diag = build_diagnostics(markets)
+    temp_examples = collect_temperature_examples(markets, limit=8)
 
-main()
+    # Console logs for GitHub Actions
+    print("=== PAGE REPORTS ===")
+    for p in pages:
+        print(p)
+
+    print("=== DIAGNOSTICS ===")
+    print(json.dumps(diag, ensure_ascii=False, indent=2))
+
+    print("=== TEMPERATURE EXAMPLES ===")
+    print(json.dumps(temp_examples, ensure_ascii=False, indent=2))
+
+    # Telegram summary
+    lines = [
+        f"✅ Read-only check @ {ts}",
+        f"📊 Raw fetched: {len(raw)}",
+        f"✅ Unique markets: {diag['unique_ids']}",
+        f"🔗 with slug: {diag['with_slug']}",
+        f"🧩 with groupItemTitle: {diag['with_group']}",
+        f"🧠 with conditionId: {diag['with_condition']}",
+        f"📚 with events: {diag['with_events']}",
+        f"💲 YES parsed OK: {diag['yes_price_ok']}",
+        f"⚠️ YES parse failed: {diag['yes_price_fail']}",
+        f"🌡️ temperature-like markets: {diag['temperature_like']}",
+        f"🛠️ YES parse modes: {diag['yes_price_by_mode']}",
+    ]
+
+    if diag["top_groups"]:
+        lines.append("📌 Top groups:")
+        for g, c in diag["top_groups"][:5]:
+            short = g if len(g) <= 50 else g[:47] + "..."
+            lines.append(f"- {short} ({c})")
+
+    if temp_examples:
+        lines.append("🌡️ Sample temp-like:")
+        for t in temp_examples[:3]:
+            q = t["question"]
+            short_q = q if len(q) <= 50 else q[:47] + "..."
+            lines.append(f"- yes={t['yes_price']} | {short_q}")
+
+    send("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()
