@@ -29,7 +29,7 @@ def kelly(p,price):
     return max(0,0.5*f)
 
 # =========================
-# Drawdown
+# Risk Controls
 # =========================
 def dd():
     global NAV,peak_NAV
@@ -44,9 +44,6 @@ def dd_adj(f):
     elif d<0.2:return .2*f
     else:return 0
 
-# =========================
-# Daily Loss
-# =========================
 def dloss():
     global NAV,daily_start_NAV
     return (daily_start_NAV-NAV)/daily_start_NAV
@@ -58,16 +55,10 @@ def dloss_adj(f):
     elif l<.06:return .2*f
     else:return 0
 
-# =========================
-# Vol Kelly
-# =========================
 def vol_adj(f,std):
     if std<=0:return f
     return max(0,f*(1/std))
 
-# =========================
-# Seasonal
-# =========================
 def seasonal(f):
     m=datetime.utcnow().month
     if m in [6,7,8]:mult=1
@@ -77,7 +68,7 @@ def seasonal(f):
     return f*mult,mult
 
 # =========================
-# NOAA
+# Models
 # =========================
 def noaa():
     try:
@@ -88,9 +79,6 @@ def noaa():
     except:
         return None,None
 
-# =========================
-# ECMWF
-# =========================
 def ecmwf():
     try:
         url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m"
@@ -100,9 +88,6 @@ def ecmwf():
     except:
         return None,None
 
-# =========================
-# NAM
-# =========================
 def nam():
     try:
         url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m&models=nam"
@@ -112,14 +97,11 @@ def nam():
     except:
         return None,None
 
-# =========================
-# Normal CDF
-# =========================
 def cdf(x,m,s):
     return .5*(1+math.erf((x-m)/(s*math.sqrt(2))))
 
 # =========================
-# Fetch Markets
+# Markets
 # =========================
 def markets():
     try:
@@ -132,7 +114,7 @@ def markets():
         return []
 
 # =========================
-# Weather Arb (Binary + Bucket)
+# Weather Arb
 # =========================
 def weather(ms):
 
@@ -140,20 +122,11 @@ def weather(ms):
     m2,s2=ecmwf()
     m3,s3=nam()
 
-    means=[]
-    stds=[]
+    means=[];stds=[]
 
-    if m1:
-        means.append(m1)
-        stds.append(s1)
-
-    if m2:
-        means.append(m2)
-        stds.append(s2)
-
-    if m3:
-        means.append(m3)
-        stds.append(s3)
+    if m1:means.append(m1);stds.append(s1)
+    if m2:means.append(m2);stds.append(s2)
+    if m3:means.append(m3);stds.append(s3)
 
     if len(means)==0:return False
 
@@ -171,8 +144,7 @@ def weather(ms):
             "reach","above",
             "below","at least",
             "high"
-        ]):
-            continue
+        ]):continue
 
         try:
             price=float(m["outcomes"][0]["price"])
@@ -198,13 +170,11 @@ def weather(ms):
                 p=1-cdf(t,mean,std)
             elif "below" in q:
                 p=cdf(t,mean,std)
-            else:
-                continue
-        else:
-            continue
+            else:continue
+        else:continue
 
-        # ✅ 3% Edge Threshold（关键）
-        if p>price+0.03:
+        # ⭐ 1% Threshold
+        if p>price+0.01:
 
             f=kelly(p,price)
             f=dd_adj(f)
@@ -215,23 +185,16 @@ def weather(ms):
             url=f"https://polymarket.com/event/{slug}"
 
             send(f"""
-🌦️ Binary / Bucket Weather Arb
+🌦️ Binary Weather Arb
 
-Market:
 {m['question']}
 
 Market={round(price,2)}
 Model ={round(p,2)}
 
 Kelly ={round(f*100,2)}% NAV
-SeasonAdj={season}
-Drawdown ={round(dd()*100,2)}%
-DailyLoss={round(dloss()*100,2)}%
 
-BUY YES
-
-🔗 Trade:
-{url}
+🔗 {url}
 """)
             found=True
 
@@ -283,8 +246,7 @@ Sum={round(s,2)}
 
 SELL all YES
 
-🔗 Trade:
-{url}
+🔗 {url}
 """)
                         found=True
 
