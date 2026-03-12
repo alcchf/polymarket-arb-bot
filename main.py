@@ -132,7 +132,7 @@ def markets():
         return []
 
 # =========================
-# Weather Arb
+# Weather Arb (Binary + Bucket)
 # =========================
 def weather(ms):
 
@@ -203,7 +203,8 @@ def weather(ms):
         else:
             continue
 
-        if p>price+.05:
+        # ✅ 3% Edge Threshold（关键）
+        if p>price+0.03:
 
             f=kelly(p,price)
             f=dd_adj(f)
