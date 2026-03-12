@@ -55,48 +55,34 @@ def dloss_adj(f):
     elif l<.06:return .2*f
     else:return 0
 
-def vol_adj(f,std):
-    if std<=0:return f
-    return max(0,f*(1/std))
-
 def seasonal(f):
     m=datetime.utcnow().month
     if m in [6,7,8]:mult=1
     elif m in [9,10,11]:mult=.7
     elif m in [3,4,5]:mult=.5
     else:mult=.3
-    return f*mult,mult
+    return f*mult
 
 # =========================
-# Models
+# ✅ Official Settlement Station
 # =========================
-def noaa():
+def knyc():
     try:
-        url="https://api.weather.gov/gridpoints/OKX/33,37/forecast/hourly"
-        d=requests.get(url,timeout=5).json()["properties"]["periods"][:12]
-        t=[p["temperature"]*9/5+32 for p in d]
-        return sum(t)/len(t),2
-    except:
-        return None,None
+        url="https://api.weather.gov/stations/KNYC/observations/latest"
+        d=requests.get(url,timeout=5).json()
+        t=d["properties"]["temperature"]["value"]
 
-def ecmwf():
-    try:
-        url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m"
-        t=requests.get(url,timeout=5).json()["hourly"]["temperature_2m"][:12]
-        t=[x*9/5+32 for x in t]
-        return sum(t)/len(t),1.5
-    except:
-        return None,None
+        if t is None:
+            return None
 
-def nam():
-    try:
-        url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m&models=nam"
-        t=requests.get(url,timeout=5).json()["hourly"]["temperature_2m"][:12]
-        t=[x*9/5+32 for x in t]
-        return sum(t)/len(t),1.2
+        t=t*9/5+32
+        return t
     except:
-        return None,None
+        return None
 
+# =========================
+# Normal CDF
+# =========================
 def cdf(x,m,s):
     return .5*(1+math.erf((x-m)/(s*math.sqrt(2))))
 
@@ -114,24 +100,14 @@ def markets():
         return []
 
 # =========================
-# Weather Arb
+# Binary Weather Arb
 # =========================
 def weather(ms):
 
-    m1,s1=noaa()
-    m2,s2=ecmwf()
-    m3,s3=nam()
+    mean=knyc()
+    if mean is None:return False
 
-    means=[];stds=[]
-
-    if m1:means.append(m1);stds.append(s1)
-    if m2:means.append(m2);stds.append(s2)
-    if m3:means.append(m3);stds.append(s3)
-
-    if len(means)==0:return False
-
-    mean=sum(means)/len(means)
-    std=sum(stds)/len(stds)
+    std=2  # station short‑term variance
 
     found=False
 
@@ -140,11 +116,10 @@ def weather(ms):
         q=m.get("question","").lower()
 
         if not any(k in q for k in [
-            "temp","temperature",
-            "reach","above",
-            "below","at least",
-            "high"
-        ]):continue
+            "reach","above","below",
+            "at least","high"
+        ]):
+            continue
 
         try:
             price=float(m["outcomes"][0]["price"])
@@ -156,36 +131,30 @@ def weather(ms):
         slug=m.get("slug")
         if not slug:continue
 
-        match=re.search(r'(\d+)\s*-\s*(\d+)',q)
         single=re.search(r'(\d+)',q)
+        if not single:continue
 
-        if match:
-            a=float(match.group(1))
-            b=float(match.group(2))
-            p=cdf(b,mean,std)-cdf(a,mean,std)
+        t=float(single.group(1))
 
-        elif single:
-            t=float(single.group(1))
-            if "above" in q or "reach" in q or "at least" in q:
-                p=1-cdf(t,mean,std)
-            elif "below" in q:
-                p=cdf(t,mean,std)
-            else:continue
-        else:continue
+        if "above" in q or "reach" in q or "at least" in q:
+            p=1-cdf(t,mean,std)
+        elif "below" in q:
+            p=cdf(t,mean,std)
+        else:
+            continue
 
-        # ⭐ 1% Threshold
+        # ⭐ 1% Edge
         if p>price+0.01:
 
             f=kelly(p,price)
             f=dd_adj(f)
             f=dloss_adj(f)
-            f=vol_adj(f,std)
-            f,season=seasonal(f)
+            f=seasonal(f)
 
             url=f"https://polymarket.com/event/{slug}"
 
             send(f"""
-🌦️ Binary Weather Arb
+🌦️ Binary Weather Arb (KNYC)
 
 {m['question']}
 
