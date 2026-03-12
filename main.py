@@ -1,11 +1,9 @@
 import requests,os
+from collections import defaultdict
 
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 
-# =========================
-# Telegram
-# =========================
 def send(msg):
     try:
         url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -13,7 +11,7 @@ def send(msg):
     except: pass
 
 # =========================
-# ✅ Deep Pagination
+# Deep Pagination
 # =========================
 def markets():
 
@@ -31,32 +29,88 @@ def markets():
 
             if r.status_code==200:
                 data=r.json()
-
                 if len(data)==0:
                     break
-
                 all+=data
         except:
             continue
 
-    ids=set()
-    for m in all:
-        if m.get("id"):
-            ids.add(m["id"])
-
-    send(f"""
-📊 Raw fetched: {len(all)}
-✅ Unique markets: {len(ids)}
-""")
-
     return all
+
+# =========================
+# ⭐ Partition Arb
+# =========================
+def partition(ms):
+
+    groups=defaultdict(list)
+    found=False
+
+    for m in ms:
+
+        g=m.get("groupItemTitle")
+        if not g:continue
+
+        try:
+            p=float(m["outcomes"][0]["price"])
+            liq=float(m["liquidity"])
+        except:continue
+
+        if liq<500:continue
+
+        groups[g].append((m,p))
+
+    for g in groups:
+
+        if len(groups[g])<4:
+            continue
+
+        sum_yes=0
+
+        for m,p in groups[g]:
+            sum_yes+=p
+
+        if sum_yes>1.03:
+
+            send(f"""
+🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
+
+Partition Arb (BUY ALL NO)
+
+Group:
+{g}
+
+Σ YES={round(sum_yes,3)}
+
+BUY NO on ALL outcomes
+Profit≈{round(sum_yes-1,3)}
+""")
+            found=True
+
+        elif sum_yes<0.97:
+
+            send(f"""
+🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
+
+Partition Arb (BUY ALL YES)
+
+Group:
+{g}
+
+Σ YES={round(sum_yes,3)}
+
+BUY YES on ALL outcomes
+Profit≈{round(1-sum_yes,3)}
+""")
+            found=True
+
+    return found
 
 # =========================
 # Mutual Arb
 # =========================
 def mutual(ms):
 
-    groups={}
+    groups=defaultdict(list)
     found=False
 
     for m in ms:
@@ -71,45 +125,29 @@ def mutual(ms):
 
         if liq<20000:continue
 
-        if g not in groups:groups[g]=[]
         groups[g].append((m,p))
 
     for g in groups:
         if len(groups[g])<3:continue
 
-        for i in range(len(groups[g])):
-            for j in range(i+1,len(groups[g])):
-                for k in range(j+1,len(groups[g])):
+        s=sum([p for _,p in groups[g]])
 
-                    s=groups[g][i][1]+groups[g][j][1]+groups[g][k][1]
-                    gap=s-1
+        if s>1.02:
 
-                    slug=groups[g][i][0].get("slug")
-                    if not slug:continue
+            slug=groups[g][0][0].get("slug")
+            if not slug:continue
 
-                    if gap>0.05:
-                        send(f"""
-🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
+            send(f"""
+🚨 EXECUTE NOW
 
-Strong Mutual Arb
-Gap={round(gap,3)}
+Mutual Arb
+Σ YES={round(s,3)}
 
 SELL all YES
 
 🔗 https://polymarket.com/event/{slug}
 """)
-                        found=True
-
-                    elif gap>0.02:
-                        send(f"""
-⚠️ Mutual Arb
-Gap={round(gap,3)}
-
-SELL all YES
-
-🔗 https://polymarket.com/event/{slug}
-""")
-                        found=True
+            found=True
 
     return found
 
@@ -141,136 +179,20 @@ def nomination(ms):
             if any(w in p[0]["question"].lower() for w in n[0]["question"].lower().split()):
 
                 gap=p[1]-n[1]
-                slug=n[0].get("slug")
-                if not slug:continue
 
                 if gap>0.05:
-                    send(f"""
-🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
 
-Strong Nomination Arb
+                    slug=n[0].get("slug")
+                    if not slug:continue
+
+                    send(f"""
+🚨 EXECUTE NOW
+
+Nomination Arb
 Gap={round(gap,3)}
 
 BUY Nomination YES
 SELL Presidency YES
-
-🔗 https://polymarket.com/event/{slug}
-""")
-                    found=True
-
-                elif gap>0.03:
-                    send(f"""
-⚠️ Nomination Arb
-Gap={round(gap,3)}
-
-BUY Nomination YES
-SELL Presidency YES
-
-🔗 https://polymarket.com/event/{slug}
-""")
-                    found=True
-
-    return found
-
-# =========================
-# Release Arb
-# =========================
-def release(ms):
-
-    rel=[];ann=[]
-    found=False
-
-    for m in ms:
-
-        q=m.get("question","").lower()
-
-        try:
-            p=float(m["outcomes"][0]["price"])
-            liq=float(m["liquidity"])
-        except:continue
-
-        if liq<20000:continue
-
-        if "release" in q: rel.append((m,p))
-        if "announce" in q: ann.append((m,p))
-
-    for r in rel:
-        for a in ann:
-
-            if any(w in r[0]["question"].lower() for w in a[0]["question"].lower().split()):
-
-                gap=r[1]-a[1]
-                slug=a[0].get("slug")
-                if not slug:continue
-
-                if gap>0.05:
-                    send(f"""
-🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
-
-Strong Release Arb
-Gap={round(gap,3)}
-
-BUY Announce YES
-SELL Release YES
-
-🔗 https://polymarket.com/event/{slug}
-""")
-                    found=True
-
-    return found
-
-# =========================
-# Bucket Arb
-# =========================
-def bucket(ms):
-
-    b=[]
-    found=False
-
-    for m in ms:
-
-        q=m.get("question","").lower()
-
-        try:
-            p=float(m["outcomes"][0]["price"])
-            liq=float(m["liquidity"])
-        except:continue
-
-        if liq<20000:continue
-
-        if any(k in q for k in ["cpi","rate","inflation","unemployment"]):
-            if "%" in q or "-" in q:
-                b.append((m,p))
-
-    for i in range(len(b)):
-        for j in range(i+1,len(b)):
-            for k in range(j+1,len(b)):
-
-                s=b[i][1]+b[j][1]+b[k][1]
-                gap=s-1
-
-                slug=b[i][0].get("slug")
-                if not slug:continue
-
-                if gap>0.07:
-                    send(f"""
-🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
-
-Strong Bucket Arb
-Gap={round(gap,3)}
-
-SELL all YES
-
-🔗 https://polymarket.com/event/{slug}
-""")
-                    found=True
-
-                elif gap>0.05:
-                    send(f"""
-⚠️ Bucket Arb
-Gap={round(gap,3)}
-
-SELL all YES
 
 🔗 https://polymarket.com/event/{slug}
 """)
@@ -283,10 +205,9 @@ SELL all YES
 # =========================
 ms=markets()
 
+p=partition(ms)
 m1=mutual(ms)
 m2=nomination(ms)
-m3=release(ms)
-m4=bucket(ms)
 
-if not m1 and not m2 and not m3 and not m4:
+if not p and not m1 and not m2:
     send("✅ Hybrid scan complete - No Arb Found")
