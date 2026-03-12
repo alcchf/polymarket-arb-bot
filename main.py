@@ -19,6 +19,7 @@ def send(msg):
 # Kelly
 # =========================
 def kelly(p,price):
+    if price<=0 or price>=1:return 0
     b=(1-price)/price
     q=1-p
     f=(b*p-q)/b
@@ -58,6 +59,7 @@ def dloss_adj(f):
 # Vol Kelly
 # =========================
 def vol_adj(f,std):
+    if std<=0:return f
     return max(0,f*(1/std))
 
 # =========================
@@ -75,9 +77,9 @@ def seasonal(f):
 # NOAA
 # =========================
 def noaa():
-    url="https://api.weather.gov/gridpoints/OKX/33,37/forecast/hourly"
     try:
-        d=requests.get(url).json()["properties"]["periods"][:12]
+        url="https://api.weather.gov/gridpoints/OKX/33,37/forecast/hourly"
+        d=requests.get(url,timeout=5).json()["properties"]["periods"][:12]
         t=[p["temperature"]*9/5+32 for p in d]
         return sum(t)/len(t),2
     except:
@@ -87,9 +89,9 @@ def noaa():
 # ECMWF
 # =========================
 def ecmwf():
-    url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m"
     try:
-        t=requests.get(url).json()["hourly"]["temperature_2m"][:12]
+        url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m"
+        t=requests.get(url,timeout=5).json()["hourly"]["temperature_2m"][:12]
         t=[x*9/5+32 for x in t]
         return sum(t)/len(t),1.5
     except:
@@ -99,9 +101,9 @@ def ecmwf():
 # NAM
 # =========================
 def nam():
-    url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m&models=nam"
     try:
-        t=requests.get(url).json()["hourly"]["temperature_2m"][:12]
+        url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m&models=nam"
+        t=requests.get(url,timeout=5).json()["hourly"]["temperature_2m"][:12]
         t=[x*9/5+32 for x in t]
         return sum(t)/len(t),1.2
     except:
@@ -117,8 +119,14 @@ def cdf(x,m,s):
 # Fetch Markets
 # =========================
 def markets():
-    return requests.get("https://gamma-api.polymarket.com/markets",
-    params={"active":"true","limit":300}).json()
+    try:
+        return requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"active":"true","limit":300},
+            timeout=5
+        ).json()
+    except:
+        return []
 
 # =========================
 # Weather Arb
@@ -129,15 +137,29 @@ def weather(ms):
     m2,s2=ecmwf()
     m3,s3=nam()
 
-    if not m1:return
+    means=[]
+    stds=[]
 
-    mean=.4*m1+.3*m2+.3*m3
-    std=.4*s1+.3*s2+.3*s3
+    if m1:
+        means.append(m1)
+        stds.append(s1)
+
+    if m2:
+        means.append(m2)
+        stds.append(s2)
+
+    if m3:
+        means.append(m3)
+        stds.append(s3)
+
+    if len(means)==0:return
+
+    mean=sum(means)/len(means)
+    std=sum(stds)/len(stds)
 
     for m in ms:
 
         q=m.get("question","").lower()
-
         if "temp" not in q:continue
 
         try:
@@ -146,6 +168,9 @@ def weather(ms):
         except:continue
 
         if liq<30000:continue
+
+        slug=m.get("slug")
+        if not slug:continue
 
         match=re.search(r'(\d+)\s*-\s*(\d+)',q)
         if not match:continue
@@ -163,10 +188,10 @@ def weather(ms):
             f=vol_adj(f,std)
             f,season=seasonal(f)
 
-            url=f"https://polymarket.com/event/{m['slug']}"
+            url=f"https://polymarket.com/event/{slug}"
 
             send(f"""
-🌦️ FINAL Ensemble Weather Arb
+🌦️ Stable Ensemble Weather Arb
 
 Market:
 {m['question']}
@@ -218,7 +243,10 @@ def mutual(ms):
 
                     if s>1.05:
 
-                        url=f"https://polymarket.com/event/{groups[g][i][0]['slug']}"
+                        slug=groups[g][i][0].get("slug")
+                        if not slug:continue
+
+                        url=f"https://polymarket.com/event/{slug}"
 
                         send(f"""
 ⚠️ Mutual Outcome Arb
