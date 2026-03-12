@@ -2,7 +2,8 @@ name: Run Polymarket Arb Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '2,22,42 22-23 * * *'
+    - cron: '2,22,42 0-15 * * *'
   workflow_dispatch:
 
 jobs:
@@ -17,6 +18,14 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-requests
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install Dependencies
         run: |
