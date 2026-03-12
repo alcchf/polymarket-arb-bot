@@ -13,6 +13,20 @@ PAGE_SIZE = 300
 MAX_OFFSET = 2400
 TIMEOUT = 10
 
+# 你想重点关注的温度/天气类关键词（只做发现，不做交易判断）
+TEMP_KEYWORDS = [
+    "temperature",
+    "temp",
+    "highest temperature",
+    "high temperature",
+    "°c",
+    "°f",
+    "fahrenheit",
+    "celsius",
+    "reach",
+    "above",
+    "below",
+]
 
 # =========================
 # Telegram
@@ -34,9 +48,8 @@ def send(msg: str):
         print(f"[WARN] Telegram send failed: {e}")
         print(msg)
 
-
 # =========================
-# Robust GET
+# Safe GET
 # =========================
 def safe_get(url, params=None):
     try:
@@ -50,9 +63,8 @@ def safe_get(url, params=None):
     except Exception as e:
         return None, str(e)
 
-
 # =========================
-# Fetch markets with deep pagination
+# Deep pagination fetch
 # =========================
 def fetch_markets():
     raw = []
@@ -74,7 +86,7 @@ def fetch_markets():
                 "status": status,
                 "count": 0,
                 "ok": False,
-                "error": text[:200]
+                "error": str(text)[:200]
             })
             continue
 
@@ -96,7 +108,7 @@ def fetch_markets():
                 "status": status,
                 "count": 0,
                 "ok": False,
-                "error": f"Unexpected type: {type(data).__name__}"
+                "error": f"Unexpected payload type: {type(data).__name__}"
             })
             continue
 
@@ -121,16 +133,16 @@ def fetch_markets():
 
     return raw, page_reports
 
-
 # =========================
-# Parse YES price safely
-# Handles:
+# Parse YES price robustly
+#
+# Supports common shapes:
 # 1) outcomePrices = '["0.27","0.73"]'
-# 2) outcomes list of dicts
-# 3) outcomes string + outcomePrices string
+# 2) outcomes = [{"name":"Yes","price":"0.27"}, ...]
+# 3) outcomes = "Yes,No" + outcomePrices = "0.27,0.73"
 # =========================
 def parse_yes_price(m):
-    # Case A: outcomePrices JSON string
+    # Case 1: outcomePrices as JSON string
     try:
         op = m.get("outcomePrices")
         if isinstance(op, str) and op.strip():
@@ -140,19 +152,18 @@ def parse_yes_price(m):
     except Exception:
         pass
 
-    # Case B: outcomes = list[dict]
+    # Case 2: outcomes list of dicts
     try:
         outcomes = m.get("outcomes")
         if isinstance(outcomes, list):
             for o in outcomes:
                 if isinstance(o, dict):
-                    name = str(o.get("name", "")).strip().lower()
-                    if name == "yes":
+                    if str(o.get("name", "")).strip().lower() == "yes":
                         return float(o.get("price", 0)), "outcomes_list_dict"
     except Exception:
         pass
 
-    # Case C: outcomes = "Yes,No" + outcomePrices = "0.27,0.73"
+    # Case 3: outcomes string + outcomePrices string
     try:
         outcomes = m.get("outcomes")
         op = m.get("outcomePrices")
@@ -168,28 +179,55 @@ def parse_yes_price(m):
 
     return None, None
 
+# =========================
+# Temperature-like detector
+# =========================
+def is_temperature_like(m):
+    q = str(m.get("question", "")).lower()
+    g = str(m.get("groupItemTitle", "")).lower()
+    return any(k in q or k in g for k in TEMP_KEYWORDS)
 
 # =========================
-# Diagnostics
+# Group key for read-only snapshots
+#
+# 这里只做“发现与人工核验”，不做套利判断。
+# 用 groupItemTitle + endDate 做一个保守的快照分组，
+# 方便你看同一组市场的 bucket 组成。
+# =========================
+def snapshot_group_key(m):
+    group_title = str(m.get("groupItemTitle") or "").strip()
+    end_date = str(m.get("endDate") or m.get("end") or "").strip()
+
+    if group_title:
+        return f"{group_title} || {end_date}"
+
+    # fallback：如果没有 groupItemTitle，就退回 question + endDate
+    q = str(m.get("question") or "").strip()
+    if q:
+        return f"{q[:80]} || {end_date}"
+
+    return None
+
+# =========================
+# Build diagnostics
 # =========================
 def build_diagnostics(markets):
     diag = {
         "total": len(markets),
         "unique_ids": 0,
         "with_slug": 0,
-        "with_group": 0,
-        "with_condition": 0,
+        "with_groupItemTitle": 0,
+        "with_conditionId": 0,
         "with_events": 0,
         "yes_price_ok": 0,
         "yes_price_fail": 0,
-        "yes_price_by_mode": defaultdict(int),
-        "temperature_like": 0,
+        "yes_price_modes": defaultdict(int),
+        "temperature_like_count": 0,
         "top_groups": [],
-        "sample_markets": [],
     }
 
     ids = set()
-    groups = defaultdict(int)
+    groups_counter = defaultdict(int)
 
     for m in markets:
         mid = m.get("id")
@@ -200,11 +238,11 @@ def build_diagnostics(markets):
             diag["with_slug"] += 1
 
         if m.get("groupItemTitle"):
-            diag["with_group"] += 1
-            groups[str(m["groupItemTitle"])] += 1
+            diag["with_groupItemTitle"] += 1
+            groups_counter[str(m["groupItemTitle"])] += 1
 
         if m.get("conditionId"):
-            diag["with_condition"] += 1
+            diag["with_conditionId"] += 1
 
         if m.get("events"):
             diag["with_events"] += 1
@@ -212,67 +250,98 @@ def build_diagnostics(markets):
         yes_price, mode = parse_yes_price(m)
         if yes_price is not None:
             diag["yes_price_ok"] += 1
-            diag["yes_price_by_mode"][mode] += 1
+            diag["yes_price_modes"][mode] += 1
         else:
             diag["yes_price_fail"] += 1
 
-        q = str(m.get("question", "")).lower()
-        g = str(m.get("groupItemTitle", "")).lower()
-
-        if any(k in q or k in g for k in [
-            "temperature", "temp", "highest temperature", "°c", "°f", "fahrenheit", "celsius"
-        ]):
-            diag["temperature_like"] += 1
-
-        if len(diag["sample_markets"]) < 10:
-            diag["sample_markets"].append({
-                "question": m.get("question", ""),
-                "groupItemTitle": m.get("groupItemTitle"),
-                "slug": m.get("slug"),
-                "conditionId": m.get("conditionId"),
-                "events_type": type(m.get("events")).__name__,
-                "outcomes_type": type(m.get("outcomes")).__name__,
-                "outcomePrices_type": type(m.get("outcomePrices")).__name__,
-            })
+        if is_temperature_like(m):
+            diag["temperature_like_count"] += 1
 
     diag["unique_ids"] = len(ids)
-    diag["top_groups"] = sorted(groups.items(), key=lambda x: x[1], reverse=True)[:10]
-    diag["yes_price_by_mode"] = dict(diag["yes_price_by_mode"])
+    diag["yes_price_modes"] = dict(diag["yes_price_modes"])
+    diag["top_groups"] = sorted(groups_counter.items(), key=lambda x: x[1], reverse=True)[:10]
 
     return diag
 
-
 # =========================
-# Temperature-like market dump
+# Collect temperature-like market examples
 # =========================
-def collect_temperature_examples(markets, limit=10):
+def collect_temperature_examples(markets, limit=12):
     out = []
 
     for m in markets:
-        q = str(m.get("question", "")).lower()
-        g = str(m.get("groupItemTitle", "")).lower()
+        if not is_temperature_like(m):
+            continue
 
-        if any(k in q or k in g for k in [
-            "temperature", "temp", "highest temperature", "°c", "°f", "fahrenheit", "celsius"
-        ]):
-            yes_price, mode = parse_yes_price(m)
+        yes_price, mode = parse_yes_price(m)
 
-            out.append({
-                "question": m.get("question", ""),
-                "groupItemTitle": m.get("groupItemTitle"),
-                "slug": m.get("slug"),
-                "conditionId": m.get("conditionId"),
-                "yes_price": yes_price,
-                "yes_mode": mode,
-                "outcomes_raw_type": type(m.get("outcomes")).__name__,
-                "outcomePrices_raw_type": type(m.get("outcomePrices")).__name__,
-            })
+        out.append({
+            "question": m.get("question", ""),
+            "groupItemTitle": m.get("groupItemTitle"),
+            "slug": m.get("slug"),
+            "conditionId": m.get("conditionId"),
+            "endDate": m.get("endDate") or m.get("end"),
+            "yes_price": yes_price,
+            "yes_mode": mode,
+            "liquidity": m.get("liquidity"),
+        })
 
-            if len(out) >= limit:
-                break
+        if len(out) >= limit:
+            break
 
     return out
 
+# =========================
+# Build grouped snapshots (read-only)
+# 只做“每组有几个 bucket、每个 bucket 的 YES 值”
+# 不做任何套利阈值判断
+# =========================
+def build_group_snapshots(markets, min_group_size=3, limit_groups=10):
+    groups = defaultdict(list)
+
+    for m in markets:
+        key = snapshot_group_key(m)
+        if not key:
+            continue
+
+        yes_price, mode = parse_yes_price(m)
+        if yes_price is None:
+            continue
+
+        groups[key].append({
+            "question": m.get("question", ""),
+            "yes": yes_price,
+            "slug": m.get("slug", ""),
+            "liquidity": m.get("liquidity"),
+            "mode": mode,
+        })
+
+    # 只保留桶数较多的组
+    filtered = []
+    for key, items in groups.items():
+        if len(items) >= min_group_size:
+            filtered.append((key, items))
+
+    # 按 bucket 数量降序
+    filtered.sort(key=lambda x: len(x[1]), reverse=True)
+
+    snapshots = []
+    for key, items in filtered[:limit_groups]:
+        snapshots.append({
+            "group_key": key,
+            "bucket_count": len(items),
+            "sum_yes": round(sum(x["yes"] for x in items), 6),
+            "items": [
+                {
+                    "yes": round(x["yes"], 6),
+                    "question": x["question"][:100],
+                    "slug": x["slug"],
+                }
+                for x in items[:12]
+            ]
+        })
+
+    return snapshots
 
 # =========================
 # Main
@@ -280,7 +349,7 @@ def collect_temperature_examples(markets, limit=10):
 def main():
     ts = int(time.time())
 
-    raw, pages = fetch_markets()
+    raw, page_reports = fetch_markets()
 
     # de-dup by id
     uniq = {}
@@ -291,11 +360,12 @@ def main():
     markets = list(uniq.values())
 
     diag = build_diagnostics(markets)
-    temp_examples = collect_temperature_examples(markets, limit=8)
+    temp_examples = collect_temperature_examples(markets, limit=10)
+    group_snapshots = build_group_snapshots(markets, min_group_size=3, limit_groups=8)
 
-    # Console logs for GitHub Actions
+    # Console logs (GitHub Actions)
     print("=== PAGE REPORTS ===")
-    for p in pages:
+    for p in page_reports:
         print(p)
 
     print("=== DIAGNOSTICS ===")
@@ -304,19 +374,22 @@ def main():
     print("=== TEMPERATURE EXAMPLES ===")
     print(json.dumps(temp_examples, ensure_ascii=False, indent=2))
 
+    print("=== GROUP SNAPSHOTS ===")
+    print(json.dumps(group_snapshots, ensure_ascii=False, indent=2))
+
     # Telegram summary
     lines = [
         f"✅ Read-only check @ {ts}",
         f"📊 Raw fetched: {len(raw)}",
         f"✅ Unique markets: {diag['unique_ids']}",
         f"🔗 with slug: {diag['with_slug']}",
-        f"🧩 with groupItemTitle: {diag['with_group']}",
-        f"🧠 with conditionId: {diag['with_condition']}",
+        f"🧩 with groupItemTitle: {diag['with_groupItemTitle']}",
+        f"🧠 with conditionId: {diag['with_conditionId']}",
         f"📚 with events: {diag['with_events']}",
         f"💲 YES parsed OK: {diag['yes_price_ok']}",
         f"⚠️ YES parse failed: {diag['yes_price_fail']}",
-        f"🌡️ temperature-like markets: {diag['temperature_like']}",
-        f"🛠️ YES parse modes: {diag['yes_price_by_mode']}",
+        f"🌡️ temperature-like markets: {diag['temperature_like_count']}",
+        f"🛠️ YES parse modes: {diag['yes_price_modes']}",
     ]
 
     if diag["top_groups"]:
@@ -329,8 +402,15 @@ def main():
         lines.append("🌡️ Sample temp-like:")
         for t in temp_examples[:3]:
             q = t["question"]
-            short_q = q if len(q) <= 50 else q[:47] + "..."
+            short_q = q if len(q) <= 48 else q[:45] + "..."
             lines.append(f"- yes={t['yes_price']} | {short_q}")
+
+    if group_snapshots:
+        lines.append("🧪 Group snapshots:")
+        for s in group_snapshots[:3]:
+            g = s["group_key"]
+            short_g = g if len(g) <= 45 else g[:42] + "..."
+            lines.append(f"- n={s['bucket_count']} sum={s['sum_yes']} | {short_g}")
 
     send("\n".join(lines))
 
