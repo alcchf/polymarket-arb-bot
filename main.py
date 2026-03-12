@@ -8,9 +8,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
-# =========================
-# Telegram
-# =========================
 def send(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -22,11 +19,6 @@ def send(msg):
     except Exception as e:
         print(f"[WARN] Telegram: {e}")
 
-# =========================
-# ✅ YES Price Parser（正确版）
-# outcomePrices = '["0.27","0.73"]'
-# YES = prices[0]
-# =========================
 def parse_yes_price(market):
     try:
         op = market.get("outcomePrices")
@@ -38,23 +30,28 @@ def parse_yes_price(market):
         print(f"[WARN] parse_yes_price: {e}")
     return None
 
-# =========================
-# Fetch Events
-# =========================
+# ✅ 加 markets=true 参数
 def fetch_events():
     all_events = []
     for offset in range(0, 1200, 100):
         try:
             r = requests.get(
                 f"{GAMMA_BASE}/events",
-                params={"active":"true","limit":100,"offset":offset},
-                headers={"User-Agent":"Mozilla/5.0"},
-                timeout=10
+                params={
+                    "active": "true",
+                    "limit": 100,
+                    "offset": offset,
+                    "markets": "true"    # ← 关键
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15
             )
             if r.status_code != 200:
+                print(f"[WARN] events offset={offset} status={r.status_code}")
                 continue
             data = r.json()
             if not isinstance(data, list) or len(data) == 0:
+                print(f"[INFO] events empty at offset={offset}")
                 break
             all_events.extend(data)
             print(f"[INFO] events offset={offset} page={len(data)} total={len(all_events)}")
@@ -62,17 +59,18 @@ def fetch_events():
             print(f"[WARN] events offset={offset}: {e}")
     return all_events
 
-# =========================
-# Fetch Markets
-# =========================
 def fetch_markets():
     all_markets = []
     for offset in range(0, 2400, 300):
         try:
             r = requests.get(
                 f"{GAMMA_BASE}/markets",
-                params={"active":"true","limit":300,"offset":offset},
-                headers={"User-Agent":"Mozilla/5.0"},
+                params={
+                    "active": "true",
+                    "limit": 300,
+                    "offset": offset
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
                 timeout=10
             )
             if r.status_code != 200:
@@ -86,9 +84,6 @@ def fetch_markets():
             print(f"[WARN] markets offset={offset}: {e}")
     return all_markets
 
-# =========================
-# ⭐ Partition Arb
-# =========================
 def partition_arb(events):
     found = False
     arb_count = 0
@@ -106,7 +101,7 @@ def partition_arb(events):
             if yes is None:
                 continue
             try:
-                liq = float(m.get("liquidity",0))
+                liq = float(m.get("liquidity", 0))
             except Exception:
                 liq = 0
             buckets.append({
@@ -162,9 +157,6 @@ def partition_arb(events):
     print(f"[INFO] partition arb found: {arb_count}")
     return found
 
-# =========================
-# Mutual Outcome Arb
-# =========================
 def mutual_arb(markets):
     found = False
     groups = defaultdict(list)
@@ -210,9 +202,6 @@ def mutual_arb(markets):
 
     return found
 
-# =========================
-# Nomination Arb
-# =========================
 def nomination_arb(markets):
     found = False
     pres = []
@@ -266,9 +255,6 @@ def nomination_arb(markets):
 
     return found
 
-# =========================
-# Run
-# =========================
 def main():
     ts = int(time.time())
     print(f"[START] ts={ts}")
