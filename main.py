@@ -1,300 +1,239 @@
-import requests
-import os
+import requests,os,math,re
+from datetime import datetime
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 
-# =========================
-# Telegram 推送
-# =========================
-def send_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
-    requests.post(url, json=payload)
-
+NAV=1000
+peak_NAV=1000
+daily_start_NAV=1000
 
 # =========================
-# 获取 Polymarket 市场
+# Telegram
 # =========================
-def fetch_markets():
-    url = "https://gamma-api.polymarket.com/markets"
-    params = {"active": "true", "closed": "false", "limit": 300}
-    response = requests.get(url, params=params)
-    return response.json()
-
+def send(msg):
+    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url,json={"chat_id":CHAT_ID,"text":msg})
 
 # =========================
-# Conditional Arb
+# Kelly
 # =========================
-def detect_conditional(markets):
+def kelly(p,price):
+    b=(1-price)/price
+    q=1-p
+    f=(b*p-q)/b
+    return max(0,0.5*f)
 
-    base = []
-    cond = []
+# =========================
+# Drawdown
+# =========================
+def dd():
+    global NAV,peak_NAV
+    if NAV>peak_NAV: peak_NAV=NAV
+    return (peak_NAV-NAV)/peak_NAV
 
-    for m in markets:
-        if not m.get("question"):
-            continue
+def dd_adj(f):
+    d=dd()
+    if d<0.05:return f
+    elif d<0.1:return .7*f
+    elif d<0.15:return .4*f
+    elif d<0.2:return .2*f
+    else:return 0
 
-        q = m["question"].lower()
+# =========================
+# Daily Loss
+# =========================
+def dloss():
+    global NAV,daily_start_NAV
+    return (daily_start_NAV-NAV)/daily_start_NAV
+
+def dloss_adj(f):
+    l=dloss()
+    if l<.02:return f
+    elif l<.04:return .5*f
+    elif l<.06:return .2*f
+    else:return 0
+
+# =========================
+# Vol Kelly
+# =========================
+def vol_adj(f,std):
+    return max(0,f*(1/std))
+
+# =========================
+# Seasonal
+# =========================
+def seasonal(f):
+    m=datetime.utcnow().month
+    if m in [6,7,8]:mult=1
+    elif m in [9,10,11]:mult=.7
+    elif m in [3,4,5]:mult=.5
+    else:mult=.3
+    return f*mult,mult
+
+# =========================
+# NOAA
+# =========================
+def noaa():
+    url="https://api.weather.gov/gridpoints/OKX/33,37/forecast/hourly"
+    try:
+        d=requests.get(url).json()["properties"]["periods"][:12]
+        t=[p["temperature"]*9/5+32 for p in d]
+        return sum(t)/len(t),2
+    except:
+        return None,None
+
+# =========================
+# ECMWF
+# =========================
+def ecmwf():
+    url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m"
+    try:
+        t=requests.get(url).json()["hourly"]["temperature_2m"][:12]
+        t=[x*9/5+32 for x in t]
+        return sum(t)/len(t),1.5
+    except:
+        return None,None
+
+# =========================
+# NAM
+# =========================
+def nam():
+    url="https://api.open-meteo.com/v1/forecast?latitude=40.7&longitude=-74&hourly=temperature_2m&models=nam"
+    try:
+        t=requests.get(url).json()["hourly"]["temperature_2m"][:12]
+        t=[x*9/5+32 for x in t]
+        return sum(t)/len(t),1.2
+    except:
+        return None,None
+
+# =========================
+# Normal CDF
+# =========================
+def cdf(x,m,s):
+    return .5*(1+math.erf((x-m)/(s*math.sqrt(2))))
+
+# =========================
+# Fetch Markets
+# =========================
+def markets():
+    return requests.get("https://gamma-api.polymarket.com/markets",
+    params={"active":"true","limit":300}).json()
+
+# =========================
+# Weather Arb
+# =========================
+def weather(ms):
+
+    m1,s1=noaa()
+    m2,s2=ecmwf()
+    m3,s3=nam()
+
+    if not m1:return
+
+    mean=.4*m1+.3*m2+.3*m3
+    std=.4*s1+.3*s2+.3*s3
+
+    for m in ms:
+
+        q=m.get("question","").lower()
+
+        if "temp" not in q:continue
 
         try:
-            price = float(m["outcomes"][0]["price"])
-            liq = float(m["liquidity"])
-        except:
-            continue
+            price=float(m["outcomes"][0]["price"])
+            liq=float(m["liquidity"])
+        except:continue
 
-        if liq < 30000:
-            continue
+        if liq<30000:continue
 
-        if "if" in q:
-            cond.append({"q": q, "p": price})
-        elif any(k in q for k in ["approved","pass","release","launch"]):
-            base.append({"q": q, "p": price})
+        match=re.search(r'(\d+)\s*-\s*(\d+)',q)
+        if not match:continue
 
-    ops = []
+        a=float(match.group(1))
+        b=float(match.group(2))
 
-    for c in cond:
-        for b in base:
-            if any(word in c["q"] for word in b["q"].split()):
-                if c["p"] > b["p"]:
-                    gap = round(c["p"]-b["p"],3)
-                    if gap > 0.05:
-                        ops.append(("CONDITIONAL",b,c,gap))
+        p=cdf(b,mean,std)-cdf(a,mean,std)
 
-    return ops
+        if p>price+.05:
 
+            f=kelly(p,price)
+            f=dd_adj(f)
+            f=dloss_adj(f)
+            f=vol_adj(f,std)
+            f,season=seasonal(f)
+
+            url=f"https://polymarket.com/event/{m['slug']}"
+
+            send(f"""
+🌦️ FINAL Ensemble Weather Arb
+
+Market:
+{m['question']}
+
+Market={round(price,2)}
+Model ={round(p,2)}
+
+Kelly ={round(f*100,2)}% NAV
+SeasonAdj={season}
+Drawdown ={round(dd()*100,2)}%
+DailyLoss={round(dloss()*100,2)}%
+
+BUY YES
+
+🔗 Trade:
+{url}
+""")
 
 # =========================
-# Release vs Announce Arb
+# Mutual Arb
 # =========================
-def detect_release(markets):
+def mutual(ms):
 
-    release = []
-    announce = []
+    groups={}
 
-    for m in markets:
-        if not m.get("question"):
-            continue
+    for m in ms:
 
-        q = m["question"].lower()
+        g=m.get("groupItemTitle")
+        if not g:continue
 
         try:
-            price = float(m["outcomes"][0]["price"])
-            liq = float(m["liquidity"])
-        except:
-            continue
+            p=float(m["outcomes"][0]["price"])
+            liq=float(m["liquidity"])
+        except:continue
 
-        if liq < 30000:
-            continue
+        if liq<30000:continue
 
-        if "release" in q:
-            release.append({"q": q, "p": price})
+        if g not in groups:groups[g]=[]
+        groups[g].append((m,p))
 
-        if "announce" in q:
-            announce.append({"q": q, "p": price})
+    for g in groups:
+        if len(groups[g])<3:continue
 
-    ops = []
+        for i in range(len(groups[g])):
+            for j in range(i+1,len(groups[g])):
+                for k in range(j+1,len(groups[g])):
 
-    for r in release:
-        for a in announce:
+                    s=groups[g][i][1]+groups[g][j][1]+groups[g][k][1]
 
-            if any(word in r["q"] for word in a["q"].split()):
+                    if s>1.05:
 
-                if r["p"] > a["p"]:
-                    gap = round(r["p"]-a["p"],3)
+                        url=f"https://polymarket.com/event/{groups[g][i][0]['slug']}"
 
-                    if gap > 0.05:
-                        ops.append(("RELEASE",a,r,gap))
+                        send(f"""
+⚠️ Mutual Outcome Arb
 
-    return ops
+Sum={round(s,2)}
 
+SELL all YES
 
-# =========================
-# Nomination Arb
-# =========================
-def detect_nomination(markets):
-
-    pres = []
-    nom = []
-
-    for m in markets:
-        if not m.get("question"):
-            continue
-
-        q = m["question"].lower()
-
-        try:
-            price = float(m["outcomes"][0]["price"])
-            liq = float(m["liquidity"])
-        except:
-            continue
-
-        if liq < 30000:
-            continue
-
-        if "president" in q:
-            pres.append({"q": q, "p": price})
-
-        if "nomination" in q or "primary" in q:
-            nom.append({"q": q, "p": price})
-
-    ops = []
-
-    for p in pres:
-        for n in nom:
-
-            if any(word in p["q"] for word in n["q"].split()):
-
-                if p["p"] > n["p"]:
-                    gap = round(p["p"]-n["p"],3)
-
-                    if gap > 0.05:
-                        ops.append(("NOMINATION",n,p,gap))
-
-    return ops
-
+🔗 Trade:
+{url}
+""")
 
 # =========================
-# CPI Bucket Arb
+# Run
 # =========================
-def detect_bucket(markets):
-
-    buckets = []
-
-    for m in markets:
-
-        if not m.get("question"):
-            continue
-
-        q = m["question"].lower()
-
-        try:
-            price = float(m["outcomes"][0]["price"])
-            liq = float(m["liquidity"])
-        except:
-            continue
-
-        if liq < 30000:
-            continue
-
-        if any(k in q for k in ["cpi","inflation","rate","unemployment"]):
-            if "%" in q or "-" in q:
-                buckets.append({"q": q, "p": price})
-
-    ops = []
-
-    for i in range(len(buckets)):
-        for j in range(i+1,len(buckets)):
-            for k in range(j+1,len(buckets)):
-
-                total = round(
-                    buckets[i]["p"]
-                    +buckets[j]["p"]
-                    +buckets[k]["p"],3
-                )
-
-                if total > 1.05:
-
-                    ops.append(("BUCKET",
-                                buckets[i],
-                                buckets[j],
-                                buckets[k],
-                                total))
-
-    return ops
-
-
-# =========================
-# 主执行逻辑
-# =========================
-markets = fetch_markets()
-
-ops1 = detect_conditional(markets)
-ops2 = detect_release(markets)
-ops3 = detect_nomination(markets)
-ops4 = detect_bucket(markets)
-
-ops = ops1 + ops2 + ops3 + ops4
-
-
-if len(ops)==0:
-    send_alert("✅ Scan complete. No Logical Arb found.")
-else:
-    for op in ops:
-
-        if op[0]=="CONDITIONAL":
-            msg=f"""
-⚠️ Conditional Arb
-
-Base:
-{op[1]['q']}
-YES={op[1]['p']}
-
-Conditional:
-{op[2]['q']}
-YES={op[2]['p']}
-
-Gap={op[3]}
-
-BUY Base YES
-SELL Conditional YES
-"""
-
-        elif op[0]=="RELEASE":
-            msg=f"""
-⚠️ Release vs Announce Arb
-
-Announce:
-{op[1]['q']}
-YES={op[1]['p']}
-
-Release:
-{op[2]['q']}
-YES={op[2]['p']}
-
-Gap={op[3]}
-
-BUY Announce YES
-SELL Release YES
-"""
-
-        elif op[0]=="NOMINATION":
-            msg=f"""
-⚠️ Nomination Arb
-
-Nomination:
-{op[1]['q']}
-YES={op[1]['p']}
-
-Presidency:
-{op[2]['q']}
-YES={op[2]['p']}
-
-Gap={op[3]}
-
-BUY Nomination YES
-SELL Presidency YES
-"""
-
-        elif op[0]=="BUCKET":
-            msg=f"""
-⚠️ CPI Bucket Arb
-
-Bucket 1:
-{op[1]['q']}
-YES={op[1]['p']}
-
-Bucket 2:
-{op[2]['q']}
-YES={op[2]['p']}
-
-Bucket 3:
-{op[3]['q']}
-YES={op[3]['p']}
-
-Sum={op[4]}
-
-SELL all 3 YES
-"""
-
-        send_alert(msg)
+ms=markets()
+weather(ms)
+mutual(ms)
