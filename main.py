@@ -1,10 +1,10 @@
 """
 Polymarket 全市场套利扫描器
 套利类型：
-  1. Bundle ARB     — YES + NO 价格之和 < 1.00
-  2. Multi-Outcome  — 多结果市场所有结果价格之和 < 1.00
-  3. Near-Expiry    — 临近结算且价格仍偏离 0/1
-  4. CLOB-Confirmed — 通过订单簿中间价二次验证 Bundle ARB
+  1. Bundle ARB     - YES + NO 价格之和 < 1.00
+  2. Multi-Outcome  - 多结果市场所有结果价格之和 < 1.00
+  3. Near-Expiry    - 临近结算且价格仍偏离 0/1
+  4. CLOB-Confirmed - 通过订单簿中间价二次验证 Bundle ARB
 作者: Aidi Zeng | 运行环境: Python 3.10+ / GitHub Actions
 """
 
@@ -16,28 +16,26 @@ import requests
 from datetime import datetime, timezone
 from typing import Optional
 
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # 配置区
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 GAMMA_API      = "https://gamma-api.polymarket.com"
 CLOB_API       = "https://clob.polymarket.com"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")   # ✅ 对应 GitHub Secret: TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")     # ✅ 对应 GitHub Secret: TELEGRAM_CHAT_ID
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")  # GitHub Secret: TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")    # GitHub Secret: TELEGRAM_CHAT_ID
 
-# 套利阈值
-BUNDLE_ARB_THRESHOLD   = 0.97          # YES+NO 之和低于此值触发
-MULTI_ARB_THRESHOLD    = 0.97          # 多结果市场价格之和低于此值触发
-NEAR_EXPIRY_HOURS      = 6             # 距结算 N 小时以内
-NEAR_EXPIRY_PROB_RANGE = (0.15, 0.85)  # 概率在此区间内视为定价异常
+BUNDLE_ARB_THRESHOLD   = 0.97
+MULTI_ARB_THRESHOLD    = 0.97
+NEAR_EXPIRY_HOURS      = 6
+NEAR_EXPIRY_PROB_RANGE = (0.15, 0.85)
+MIN_LIQUIDITY = 500
+PAGE_SIZE     = 100
+MAX_PAGES     = 50
+REQUEST_DELAY = 0.3
 
-MIN_LIQUIDITY = 500    # 最小流动性（USDC），过滤垃圾市场
-PAGE_SIZE     = 100    # Gamma API 每页条数
-MAX_PAGES     = 50     # 最多抓取页数（50×100 = 5000 个市场）
-REQUEST_DELAY = 0.3    # 请求间隔（秒），避免触发限速
-
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # 日志
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -46,15 +44,14 @@ logging.basicConfig(
 log = logging.getLogger("PolyArb")
 
 
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # Telegram 通知
-# ──────────────────────────────────────────────────────────────
-def send_telegram(msg: str):
-    """向 Telegram Bot 发送消息；未配置时静默跳过。"""
+# ----------------------------------------------------------------
+def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         log.info("[Telegram] 未配置，跳过推送")
         return
-    url = "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN)
+    url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
     try:
         resp = requests.post(url, json={
             "chat_id":    TELEGRAM_CHAT,
@@ -65,39 +62,37 @@ def send_telegram(msg: str):
         if resp.status_code == 200:
             log.info("[Telegram] 消息发送成功")
         else:
-            log.warning("[Telegram] 发送失败: {}".format(resp.text))
+            log.warning("[Telegram] 发送失败: " + resp.text)
     except Exception as e:
-        log.warning("[Telegram] 异常: {}".format(e))
+        log.warning("[Telegram] 异常: " + str(e))
 
 
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # HTTP Session
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 SESSION = requests.Session()
 SESSION.headers.update({"Accept": "application/json"})
 
 
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # API 工具
-# ──────────────────────────────────────────────────────────────
-def gamma_get(path: str, params: dict = None) -> Optional[dict]:
-    """请求 Gamma REST API，失败时返回 None。"""
-    url = "{}{}".format(GAMMA_API, path)
+# ----------------------------------------------------------------
+def gamma_get(path, params=None):
+    url = GAMMA_API + path
     try:
         r = SESSION.get(url, params=params, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        log.warning("Gamma API 请求失败 {}: {}".format(path, e))
+        log.warning("Gamma API 请求失败 " + path + ": " + str(e))
         return None
 
 
-def clob_get_midprice(token_id: str) -> Optional[float]:
-    """从 CLOB 订单簿获取某 token 的中间价 (best_buy + best_sell) / 2。"""
+def clob_get_midprice(token_id):
     try:
-        r_buy  = SESSION.get("{}/price".format(CLOB_API),
+        r_buy  = SESSION.get(CLOB_API + "/price",
                              params={"token_id": token_id, "side": "BUY"},  timeout=8)
-        r_sell = SESSION.get("{}/price".format(CLOB_API),
+        r_sell = SESSION.get(CLOB_API + "/price",
                              params={"token_id": token_id, "side": "SELL"}, timeout=8)
         buy_price  = float(r_buy.json().get("price",  0))
         sell_price = float(r_sell.json().get("price", 0))
@@ -108,12 +103,10 @@ def clob_get_midprice(token_id: str) -> Optional[float]:
         return None
 
 
-# CLOB 中间价缓存，避免重复请求
 _clob_cache = {}
 
 
-def clob_midprice_cached(token_id: str) -> Optional[float]:
-    """带缓存的 CLOB 中间价查询。"""
+def clob_midprice_cached(token_id):
     if token_id in _clob_cache:
         return _clob_cache[token_id]
     price = clob_get_midprice(token_id)
@@ -122,16 +115,14 @@ def clob_midprice_cached(token_id: str) -> Optional[float]:
     return price
 
 
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # 数据抓取：全量市场
-# ──────────────────────────────────────────────────────────────
-def fetch_all_markets() -> list:
-    """分页抓取所有活跃市场，过滤流动性不足的市场。"""
+# ----------------------------------------------------------------
+def fetch_all_markets():
     markets = []
     offset  = 0
-
     for _ in range(MAX_PAGES):
-        log.info("抓取市场 offset={} ...".format(offset))
+        log.info("抓取市场 offset=" + str(offset) + " ...")
         data = gamma_get("/markets", params={
             "limit":             PAGE_SIZE,
             "offset":            offset,
@@ -139,41 +130,32 @@ def fetch_all_markets() -> list:
             "closed":            "false",
             "liquidity_num_min": MIN_LIQUIDITY,
         })
-
         if not data:
             break
-
         if isinstance(data, list):
             batch = data
         elif isinstance(data, dict):
             batch = data.get("data", data.get("markets", []))
         else:
             break
-
         if not batch:
             log.info("已抓取全部市场")
             break
-
         markets.extend(batch)
-        log.info("  已累计 {} 个市场".format(len(markets)))
-
+        log.info("  已累计 " + str(len(markets)) + " 个市场")
         if len(batch) < PAGE_SIZE:
             break
-
         offset += PAGE_SIZE
         time.sleep(REQUEST_DELAY)
-
-    log.info("✅ 共抓取 {} 个活跃市场".format(len(markets)))
+    log.info("✅ 共抓取 " + str(len(markets)) + " 个活跃市场")
     return markets
 
 
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # 套利检测模块
-# ──────────────────────────────────────────────────────────────
-def parse_prices(market: dict) -> list:
-    """解析市场中各 outcome 的价格，过滤掉 0 和 1 边界值。"""
+# ----------------------------------------------------------------
+def parse_prices(market):
     prices = []
-
     raw = market.get("outcomePrices")
     if raw:
         try:
@@ -182,25 +164,20 @@ def parse_prices(market: dict) -> list:
             prices = [float(p) for p in raw if p is not None]
         except Exception:
             pass
-
     if not prices:
         tokens = market.get("tokens", [])
         prices = [float(t.get("price", 0)) for t in tokens if t.get("price") is not None]
-
     return [p for p in prices if 0 < p < 1]
 
 
-def market_url(market: dict) -> str:
-    """拼接市场链接。"""
+def market_url(market):
     slug = market.get("slug", "")
-    return "https://polymarket.com/market/{}".format(slug) if slug else "N/A"
+    if slug:
+        return "https://polymarket.com/market/" + slug
+    return "N/A"
 
 
-def detect_bundle_arb(market: dict) -> Optional[dict]:
-    """
-    Bundle 套利：YES + NO 价格之和 < 阈值
-    原理：YES + NO 应等于 $1.00，若 < 0.97 则可同时买入双边锁定利润。
-    """
+def detect_bundle_arb(market):
     prices = parse_prices(market)
     if len(prices) != 2:
         return None
@@ -220,11 +197,7 @@ def detect_bundle_arb(market: dict) -> Optional[dict]:
     return None
 
 
-def detect_multi_outcome_arb(market: dict) -> Optional[dict]:
-    """
-    多结果市场套利：所有结果价格之和 < 阈值
-    原理：A + B + C + ... 应等于 $1.00，若 < 0.97 则可全部买入。
-    """
+def detect_multi_outcome_arb(market):
     prices = parse_prices(market)
     if len(prices) < 3:
         return None
@@ -232,7 +205,7 @@ def detect_multi_outcome_arb(market: dict) -> Optional[dict]:
     if total < MULTI_ARB_THRESHOLD:
         edge = round(1.0 - total, 4)
         return {
-            "type":      "Multi-Outcome ARB ({} outcomes)".format(len(prices)),
+            "type":      "Multi-Outcome ARB (" + str(len(prices)) + " outcomes)",
             "market":    market.get("question", market.get("slug", "N/A")),
             "url":       market_url(market),
             "prices":    prices,
@@ -244,11 +217,7 @@ def detect_multi_outcome_arb(market: dict) -> Optional[dict]:
     return None
 
 
-def detect_near_expiry_arb(market: dict) -> Optional[dict]:
-    """
-    临近结算异常：距结算 < N 小时，但价格仍在 [0.15, 0.85] 区间。
-    原理：结算前几小时结果基本确定，价格偏离 0/1 说明市场定价异常。
-    """
+def detect_near_expiry_arb(market):
     end_date = market.get("endDate") or market.get("end_date_iso")
     if not end_date:
         return None
@@ -278,11 +247,7 @@ def detect_near_expiry_arb(market: dict) -> Optional[dict]:
     return None
 
 
-def detect_clob_spread_arb(market: dict) -> Optional[dict]:
-    """
-    CLOB 订单簿确认：用实际中间价二次验证 Bundle ARB。
-    仅在 Bundle ARB 候选命中时调用，避免过多 API 请求。
-    """
+def detect_clob_spread_arb(market):
     tokens = market.get("tokens", [])
     if len(tokens) != 2:
         return None
@@ -312,139 +277,74 @@ def detect_clob_spread_arb(market: dict) -> Optional[dict]:
     return None
 
 
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # 格式化输出
-# ──────────────────────────────────────────────────────────────
-def format_opportunity(opp: dict, idx: int) -> str:
-    """将套利机会格式化为终端可读字符串。"""
+# ----------------------------------------------------------------
+def format_opportunity(opp, idx):
     price_list = opp.get("prices") or opp.get("prices_clob", [])
-    lines = [
-        "=" * 60,
-        "🔥 #{:02d}  {}".format(idx, opp["type"]),
-        "📋 市场: {}".format(opp["market"][:80]),
-        "🔗 链接: {}".format(opp.get("url", "N/A")),
-        "💰 流动性: ${}".format(opp.get("liquidity", "N/A")),
-    ]
+    sep = "=" * 60
+    out = sep + "\n"
+    out += "🔥 #{:02d}  {}\n".format(idx, opp["type"])
+    out += "📋 市场: {}\n".format(opp["market"][:80])
+    out += "🔗 链接: {}\n".format(opp.get("url", "N/A"))
+    out += "💰 流动性: ${}\n".format(opp.get("liquidity", "N/A"))
     if "sum" in opp:
-        lines.append("📊 价格之和: {}  (套利空间: {})".format(
-            opp["sum"], opp.get("edge_pct", "N/A")))
-        lines.append("   各结果价格: {}".format(price_list))
+        out += "📊 价格之和: {}  (套利空间: {})\n".format(opp["sum"], opp.get("edge_pct", "N/A"))
+        out += "   各结果价格: {}\n".format(price_list)
     if "hours_left" in opp:
-        lines.append("⏰ 距结算: {} 小时".format(opp["hours_left"]))
-        lines.append("⚠️  异常价格: {}".format(opp["suspicious"]))
-    return "
-".join(lines)
+        out += "⏰ 距结算: {} 小时\n".format(opp["hours_left"])
+        out += "⚠️  异常价格: {}\n".format(opp["suspicious"])
+    return out
 
 
-def build_telegram_message(opportunities: list, total_markets: int) -> str:
-    """构建发往 Telegram 的 HTML 消息，展示 TOP 5 机会。"""
+def build_telegram_message(opportunities, total_markets):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [
-        "<b>🔥 Polymarket 套利扫描 — 发现 {} 个机会</b>".format(len(opportunities)),
-        "⏰ {}".format(now_str),
-        "📦 共扫描市场: {} 个".format(total_markets),
-        "",
-    ]
+    msg  = "<b>🔥 Polymarket 套利扫描 — 发现 " + str(len(opportunities)) + " 个机会</b>\n"
+    msg += "⏰ " + now_str + "\n"
+    msg += "📦 共扫描市场: " + str(total_markets) + " 个\n\n"
     for idx, opp in enumerate(opportunities[:5], 1):
         url      = opp.get("url", "#")
         mkt_name = opp.get("market", "N/A")[:60]
-        lines.append("<b>#{} {}</b>".format(idx, opp["type"]))
-        lines.append("📋 {}".format(mkt_name))
+        msg += "<b>#" + str(idx) + " " + opp["type"] + "</b>\n"
+        msg += "📋 " + mkt_name + "\n"
         if "edge_pct" in opp:
-            lines.append("💹 套利空间: {}".format(opp["edge_pct"]))
+            msg += "💹 套利空间: " + opp["edge_pct"] + "\n"
         if "sum" in opp:
             price_list = opp.get("prices") or opp.get("prices_clob", [])
-            lines.append("📊 价格: {}  合计: {}".format(price_list, opp["sum"]))
+            msg += "📊 价格: " + str(price_list) + "  合计: " + str(opp["sum"]) + "\n"
         if "hours_left" in opp:
-            lines.append("⏰ 距结算: {}h".format(opp["hours_left"]))
-        lines.append('🔗 <a href="{}">查看市场</a>'.format(url))
-        lines.append("")
-    return "
-".join(lines)
+            msg += "⏰ 距结算: " + str(opp["hours_left"]) + "h\n"
+        msg += '🔗 <a href="' + url + '">查看市场</a>\n\n'
+    return msg
 
 
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 # 主扫描流程
-# ──────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
     log.info("🚀 Polymarket 套利扫描器启动")
-    log.info("⏰ 时间: {}".format(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
+    log.info("⏰ 时间: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     log.info("📌 阈值: Bundle={}, Multi={}".format(BUNDLE_ARB_THRESHOLD, MULTI_ARB_THRESHOLD))
     log.info("=" * 60)
 
-    # ── Step 1: 抓取全量市场 ──────────────────────────────────
+    # Step 1: 抓取全量市场
     markets = fetch_all_markets()
     if not markets:
-        log.error("❌ 未能获取任何市场数据，请检查网络或 API 状态")
+        log.error("❌ 未能获取任何市场数据")
         send_telegram("❌ Polymarket 扫描失败：无法获取市场数据")
         return
 
-    # ── Step 2: 逐市场初步扫描 ────────────────────────────────
+    # Step 2: 逐市场初步扫描
     opportunities     = []
     bundle_candidates = []
-
     for i, market in enumerate(markets):
         if i % 500 == 0 and i > 0:
             log.info("  扫描进度: {}/{} ...".format(i, len(markets)))
-
         result = detect_bundle_arb(market)
         if result:
             bundle_candidates.append((market, result))
-
         result = detect_multi_outcome_arb(market)
         if result:
             opportunities.append(result)
-
         result = detect_near_expiry_arb(market)
-        if result:
-            opportunities.append(result)
-
-    log.info("📊 初步扫描完成: Bundle候选={}, 其他机会={}".format(
-        len(bundle_candidates), len(opportunities)))
-
-    # ── Step 3: CLOB 二次验证 Bundle 候选 ────────────────────
-    log.info("🔍 CLOB 二次验证 {} 个 Bundle 候选...".format(len(bundle_candidates)))
-    for market, prelim in bundle_candidates:
-        confirmed = detect_clob_spread_arb(market)
-        opportunities.append(confirmed if confirmed else prelim)
-        time.sleep(REQUEST_DELAY)
-
-    # ── Step 4: 按套利空间降序排列 ───────────────────────────
-    opportunities.sort(key=lambda o: o.get("edge", 0), reverse=True)
-
-    # ── Step 5: 输出结果 ─────────────────────────────────────
-    log.info("=" * 60)
-    log.info("✅ 扫描完成！发现 {} 个套利机会".format(len(opportunities)))
-    log.info("=" * 60)
-
-    if not opportunities:
-        log.info("😴 本轮未发现套利机会")
-        send_telegram(
-            "😴 <b>Polymarket 套利扫描完成</b>\n"
-            "⏰ {}\n"
-            "📦 共扫描: {} 个市场\n"
-            "📭 本轮无套利机会".format(
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                len(markets)
-            )
-        )
-    else:
-        for idx, opp in enumerate(opportunities, 1):
-            print(format_opportunity(opp, idx))
-        send_telegram(build_telegram_message(opportunities, len(markets)))
-
-    # ── Step 6: 保存 JSON 报告 ────────────────────────────────
-    report = {
-        "scan_time":             datetime.now(timezone.utc).isoformat(),
-        "total_markets_scanned": len(markets),
-        "opportunities_found":   len(opportunities),
-        "opportunities":         opportunities,
-    }
-    with open("arb_report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-    log.info("📁 报告已保存至 arb_report.json")
-
-
-if __name__ == "__main__":
-    scan()
