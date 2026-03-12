@@ -4,10 +4,6 @@ from datetime import datetime
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 
-NAV=1000
-peak_NAV=1000
-daily_start_NAV=1000
-
 # =========================
 # Telegram
 # =========================
@@ -15,76 +11,7 @@ def send(msg):
     try:
         url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url,json={"chat_id":CHAT_ID,"text":msg},timeout=5)
-    except:
-        pass
-
-# =========================
-# Kelly
-# =========================
-def kelly(p,price):
-    if price<=0 or price>=1:return 0
-    b=(1-price)/price
-    q=1-p
-    f=(b*p-q)/b
-    return max(0,0.5*f)
-
-# =========================
-# Risk Controls
-# =========================
-def dd():
-    global NAV,peak_NAV
-    if NAV>peak_NAV: peak_NAV=NAV
-    return (peak_NAV-NAV)/peak_NAV
-
-def dd_adj(f):
-    d=dd()
-    if d<0.05:return f
-    elif d<0.1:return .7*f
-    elif d<0.15:return .4*f
-    elif d<0.2:return .2*f
-    else:return 0
-
-def dloss():
-    global NAV,daily_start_NAV
-    return (daily_start_NAV-NAV)/daily_start_NAV
-
-def dloss_adj(f):
-    l=dloss()
-    if l<.02:return f
-    elif l<.04:return .5*f
-    elif l<.06:return .2*f
-    else:return 0
-
-def seasonal(f):
-    m=datetime.utcnow().month
-    if m in [6,7,8]:mult=1
-    elif m in [9,10,11]:mult=.7
-    elif m in [3,4,5]:mult=.5
-    else:mult=.3
-    return f*mult
-
-# =========================
-# ✅ Official Settlement Station
-# =========================
-def knyc():
-    try:
-        url="https://api.weather.gov/stations/KNYC/observations/latest"
-        d=requests.get(url,timeout=5).json()
-        t=d["properties"]["temperature"]["value"]
-
-        if t is None:
-            return None
-
-        t=t*9/5+32
-        return t
-    except:
-        return None
-
-# =========================
-# Normal CDF
-# =========================
-def cdf(x,m,s):
-    return .5*(1+math.erf((x-m)/(s*math.sqrt(2))))
+    except: pass
 
 # =========================
 # Markets
@@ -96,104 +23,32 @@ def markets():
             params={"active":"true","limit":300},
             timeout=5
         ).json()
-    except:
-        return []
+    except: return []
 
 # =========================
-# Binary Weather Arb
-# =========================
-def weather(ms):
-
-    mean=knyc()
-    if mean is None:return False
-
-    std=2  # station short‑term variance
-
-    found=False
-
-    for m in ms:
-
-        q=m.get("question","").lower()
-
-        if not any(k in q for k in [
-            "reach","above","below",
-            "at least","high"
-        ]):
-            continue
-
-        try:
-            price=float(m["outcomes"][0]["price"])
-            liq=float(m["liquidity"])
-        except:continue
-
-        if liq<30000:continue
-
-        slug=m.get("slug")
-        if not slug:continue
-
-        single=re.search(r'(\d+)',q)
-        if not single:continue
-
-        t=float(single.group(1))
-
-        if "above" in q or "reach" in q or "at least" in q:
-            p=1-cdf(t,mean,std)
-        elif "below" in q:
-            p=cdf(t,mean,std)
-        else:
-            continue
-
-        # ⭐ 1% Edge
-        if p>price+0.01:
-
-            f=kelly(p,price)
-            f=dd_adj(f)
-            f=dloss_adj(f)
-            f=seasonal(f)
-
-            url=f"https://polymarket.com/event/{slug}"
-
-            send(f"""
-🌦️ Binary Weather Arb (KNYC)
-
-{m['question']}
-
-Market={round(price,2)}
-Model ={round(p,2)}
-
-Kelly ={round(f*100,2)}% NAV
-
-🔗 {url}
-""")
-            found=True
-
-    return found
-
-# =========================
-# Mutual Arb
+# Mutual Outcome Arb
 # =========================
 def mutual(ms):
 
     groups={}
-    found=False
 
     for m in ms:
 
         g=m.get("groupItemTitle")
-        if not g:continue
+        if not g: continue
 
         try:
             p=float(m["outcomes"][0]["price"])
             liq=float(m["liquidity"])
-        except:continue
+        except: continue
 
-        if liq<30000:continue
+        if liq<20000: continue
 
-        if g not in groups:groups[g]=[]
+        if g not in groups: groups[g]=[]
         groups[g].append((m,p))
 
     for g in groups:
-        if len(groups[g])<3:continue
+        if len(groups[g])<3: continue
 
         for i in range(len(groups[g])):
             for j in range(i+1,len(groups[g])):
@@ -201,12 +56,10 @@ def mutual(ms):
 
                     s=groups[g][i][1]+groups[g][j][1]+groups[g][k][1]
 
-                    if s>1.05:
+                    if s>1.02:
 
                         slug=groups[g][i][0].get("slug")
-                        if not slug:continue
-
-                        url=f"https://polymarket.com/event/{slug}"
+                        if not slug: continue
 
                         send(f"""
 ⚠️ Mutual Outcome Arb
@@ -215,19 +68,193 @@ Sum={round(s,2)}
 
 SELL all YES
 
-🔗 {url}
+🔗 https://polymarket.com/event/{slug}
 """)
-                        found=True
 
-    return found
+# =========================
+# Nomination Arb
+# =========================
+def nomination(ms):
+
+    pres=[];nom=[]
+
+    for m in ms:
+
+        q=m.get("question","").lower()
+
+        try:
+            p=float(m["outcomes"][0]["price"])
+            liq=float(m["liquidity"])
+        except: continue
+
+        if liq<20000: continue
+
+        if "president" in q:
+            pres.append((m,p))
+
+        if "nomination" in q or "primary" in q:
+            nom.append((m,p))
+
+    for p in pres:
+        for n in nom:
+
+            if any(w in p[0]["question"].lower() for w in n[0]["question"].lower().split()):
+
+                if p[1]>n[1]+0.03:
+
+                    slug=n[0].get("slug")
+                    if not slug: continue
+
+                    send(f"""
+⚠️ Nomination Arb
+
+BUY Nomination YES
+SELL Presidency YES
+
+🔗 https://polymarket.com/event/{slug}
+""")
+
+# =========================
+# Release Arb
+# =========================
+def release(ms):
+
+    rel=[];ann=[]
+
+    for m in ms:
+
+        q=m.get("question","").lower()
+
+        try:
+            p=float(m["outcomes"][0]["price"])
+            liq=float(m["liquidity"])
+        except: continue
+
+        if liq<20000: continue
+
+        if "release" in q: rel.append((m,p))
+        if "announce" in q: ann.append((m,p))
+
+    for r in rel:
+        for a in ann:
+
+            if any(w in r[0]["question"].lower() for w in a[0]["question"].lower().split()):
+
+                if r[1]>a[1]+0.03:
+
+                    slug=a[0].get("slug")
+                    if not slug: continue
+
+                    send(f"""
+⚠️ Release vs Announce Arb
+
+BUY Announce YES
+SELL Release YES
+
+🔗 https://polymarket.com/event/{slug}
+""")
+
+# =========================
+# Bucket Arb
+# =========================
+def bucket(ms):
+
+    b=[]
+
+    for m in ms:
+
+        q=m.get("question","").lower()
+
+        try:
+            p=float(m["outcomes"][0]["price"])
+            liq=float(m["liquidity"])
+        except: continue
+
+        if liq<20000: continue
+
+        if any(k in q for k in ["cpi","rate","inflation","unemployment"]):
+            if "%" in q or "-" in q:
+                b.append((m,p))
+
+    for i in range(len(b)):
+        for j in range(i+1,len(b)):
+            for k in range(j+1,len(b)):
+
+                s=b[i][1]+b[j][1]+b[k][1]
+
+                if s>1.05:
+
+                    slug=b[i][0].get("slug")
+                    if not slug: continue
+
+                    send(f"""
+⚠️ Bucket Arb
+
+SELL all YES
+
+🔗 https://polymarket.com/event/{slug}
+""")
+
+# =========================
+# Weather (辅助)
+# =========================
+def weather(ms):
+
+    try:
+        url="https://api.weather.gov/stations/KNYC/observations/latest"
+        d=requests.get(url,timeout=5).json()
+        mean=d["properties"]["temperature"]["value"]*9/5+32
+    except: return
+
+    std=2
+
+    for m in ms:
+
+        q=m.get("question","").lower()
+
+        if not any(k in q for k in ["reach","above","below"]): continue
+
+        try:
+            price=float(m["outcomes"][0]["price"])
+            liq=float(m["liquidity"])
+        except: continue
+
+        if liq<20000: continue
+
+        slug=m.get("slug")
+        if not slug: continue
+
+        single=re.search(r'(\d+)',q)
+        if not single: continue
+
+        t=float(single.group(1))
+
+        if "above" in q or "reach" in q:
+            p=1-0.5*(1+math.erf((t-mean)/(std*math.sqrt(2))))
+        elif "below" in q:
+            p=0.5*(1+math.erf((t-mean)/(std*math.sqrt(2))))
+        else: continue
+
+        if p>price+0.01:
+
+            send(f"""
+🌦️ Weather Arb
+
+BUY YES
+
+🔗 https://polymarket.com/event/{slug}
+""")
 
 # =========================
 # Run
 # =========================
 ms=markets()
 
-w=weather(ms)
-m=mutual(ms)
+mutual(ms)
+nomination(ms)
+release(ms)
+bucket(ms)
+weather(ms)
 
-if not w and not m:
-    send("✅ Bot ran successfully - No Arb Found")
+send("✅ Hybrid scan complete")
+``
