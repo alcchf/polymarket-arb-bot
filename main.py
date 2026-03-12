@@ -155,6 +155,56 @@ def detect_nomination(markets):
 
 
 # =========================
+# CPI Bucket Arb
+# =========================
+def detect_bucket(markets):
+
+    buckets = []
+
+    for m in markets:
+
+        if not m.get("question"):
+            continue
+
+        q = m["question"].lower()
+
+        try:
+            price = float(m["outcomes"][0]["price"])
+            liq = float(m["liquidity"])
+        except:
+            continue
+
+        if liq < 30000:
+            continue
+
+        if any(k in q for k in ["cpi","inflation","rate","unemployment"]):
+            if "%" in q or "-" in q:
+                buckets.append({"q": q, "p": price})
+
+    ops = []
+
+    for i in range(len(buckets)):
+        for j in range(i+1,len(buckets)):
+            for k in range(j+1,len(buckets)):
+
+                total = round(
+                    buckets[i]["p"]
+                    +buckets[j]["p"]
+                    +buckets[k]["p"],3
+                )
+
+                if total > 1.05:
+
+                    ops.append(("BUCKET",
+                                buckets[i],
+                                buckets[j],
+                                buckets[k],
+                                total))
+
+    return ops
+
+
+# =========================
 # 主执行逻辑
 # =========================
 markets = fetch_markets()
@@ -162,8 +212,9 @@ markets = fetch_markets()
 ops1 = detect_conditional(markets)
 ops2 = detect_release(markets)
 ops3 = detect_nomination(markets)
+ops4 = detect_bucket(markets)
 
-ops = ops1 + ops2 + ops3
+ops = ops1 + ops2 + ops3 + ops4
 
 
 if len(ops)==0:
@@ -223,6 +274,27 @@ Gap={op[3]}
 
 BUY Nomination YES
 SELL Presidency YES
+"""
+
+        elif op[0]=="BUCKET":
+            msg=f"""
+⚠️ CPI Bucket Arb
+
+Bucket 1:
+{op[1]['q']}
+YES={op[1]['p']}
+
+Bucket 2:
+{op[2]['q']}
+YES={op[2]['p']}
+
+Bucket 3:
+{op[3]['q']}
+YES={op[3]['p']}
+
+Sum={op[4]}
+
+SELL all 3 YES
 """
 
         send_alert(msg)
