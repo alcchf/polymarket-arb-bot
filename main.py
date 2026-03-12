@@ -13,7 +13,7 @@ def send(msg):
     except: pass
 
 # =========================
-# ✅ Deep Pagination + Unique Check
+# ✅ Deep Pagination
 # =========================
 def markets():
 
@@ -24,11 +24,7 @@ def markets():
         try:
             r=requests.get(
                 "https://gamma-api.polymarket.com/markets",
-                params={
-                    "active":"true",
-                    "limit":300,
-                    "offset":i
-                },
+                params={"active":"true","limit":300,"offset":i},
                 headers={"User-Agent":"Mozilla/5.0"},
                 timeout=10
             )
@@ -40,11 +36,9 @@ def markets():
                     break
 
                 all+=data
-
         except:
             continue
 
-    # ✅ Unique Market Check
     ids=set()
     for m in all:
         if m.get("id"):
@@ -58,7 +52,7 @@ def markets():
     return all
 
 # =========================
-# Mutual Outcome Arb
+# Mutual Arb
 # =========================
 def mutual(ms):
 
@@ -88,22 +82,35 @@ def mutual(ms):
                 for k in range(j+1,len(groups[g])):
 
                     s=groups[g][i][1]+groups[g][j][1]+groups[g][k][1]
+                    gap=s-1
 
-                    if s>1.02:
+                    slug=groups[g][i][0].get("slug")
+                    if not slug:continue
 
-                        slug=groups[g][i][0].get("slug")
-                        if not slug:continue
-
+                    if gap>0.05:
                         send(f"""
-⚠️ Mutual Outcome Arb
+🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
 
-Sum={round(s,2)}
+Strong Mutual Arb
+Gap={round(gap,3)}
 
 SELL all YES
 
 🔗 https://polymarket.com/event/{slug}
 """)
                         found=True
+
+                    elif gap>0.02:
+                        send(f"""
+⚠️ Mutual Arb
+Gap={round(gap,3)}
+
+SELL all YES
+
+🔗 https://polymarket.com/event/{slug}
+""")
+                        found=True
+
     return found
 
 # =========================
@@ -133,13 +140,16 @@ def nomination(ms):
 
             if any(w in p[0]["question"].lower() for w in n[0]["question"].lower().split()):
 
-                if p[1]>n[1]+0.03:
+                gap=p[1]-n[1]
+                slug=n[0].get("slug")
+                if not slug:continue
 
-                    slug=n[0].get("slug")
-                    if not slug:continue
-
+                if gap>0.05:
                     send(f"""
-⚠️ Nomination Arb
+🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
+
+Strong Nomination Arb
+Gap={round(gap,3)}
 
 BUY Nomination YES
 SELL Presidency YES
@@ -147,6 +157,19 @@ SELL Presidency YES
 🔗 https://polymarket.com/event/{slug}
 """)
                     found=True
+
+                elif gap>0.03:
+                    send(f"""
+⚠️ Nomination Arb
+Gap={round(gap,3)}
+
+BUY Nomination YES
+SELL Presidency YES
+
+🔗 https://polymarket.com/event/{slug}
+""")
+                    found=True
+
     return found
 
 # =========================
@@ -176,13 +199,16 @@ def release(ms):
 
             if any(w in r[0]["question"].lower() for w in a[0]["question"].lower().split()):
 
-                if r[1]>a[1]+0.03:
+                gap=r[1]-a[1]
+                slug=a[0].get("slug")
+                if not slug:continue
 
-                    slug=a[0].get("slug")
-                    if not slug:continue
-
+                if gap>0.05:
                     send(f"""
-⚠️ Release vs Announce Arb
+🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
+
+Strong Release Arb
+Gap={round(gap,3)}
 
 BUY Announce YES
 SELL Release YES
@@ -190,6 +216,7 @@ SELL Release YES
 🔗 https://polymarket.com/event/{slug}
 """)
                     found=True
+
     return found
 
 # =========================
@@ -220,20 +247,35 @@ def bucket(ms):
             for k in range(j+1,len(b)):
 
                 s=b[i][1]+b[j][1]+b[k][1]
+                gap=s-1
 
-                if s>1.05:
+                slug=b[i][0].get("slug")
+                if not slug:continue
 
-                    slug=b[i][0].get("slug")
-                    if not slug:continue
-
+                if gap>0.07:
                     send(f"""
-⚠️ Bucket Arb
+🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
+
+Strong Bucket Arb
+Gap={round(gap,3)}
 
 SELL all YES
 
 🔗 https://polymarket.com/event/{slug}
 """)
                     found=True
+
+                elif gap>0.05:
+                    send(f"""
+⚠️ Bucket Arb
+Gap={round(gap,3)}
+
+SELL all YES
+
+🔗 https://polymarket.com/event/{slug}
+""")
+                    found=True
+
     return found
 
 # =========================
