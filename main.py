@@ -274,6 +274,11 @@ def is_mutually_exclusive(q1, q2):
     return False
 
 
+def has_numeric_threshold(q):
+    pattern = r'\$\d+[\.,]?\d*\s*[MBKmb]|\d+\s*(?:million|billion|thousand)'
+    return bool(re.search(pattern, q, re.IGNORECASE))
+
+
 def is_push_worthy(opp):
     urgency = opp.get("urgency", "EARLY")
     edge    = opp.get("edge", 0)
@@ -506,12 +511,13 @@ def detect_clob_confirmed(market, threshold):
 
 
 # ----------------------------------------------------------------
-# ARB detectors - NEW (with mutex filter)
+# ARB detectors - cross-market (v6: +nested-threshold filter)
 # ----------------------------------------------------------------
 def detect_cross_market(markets, b_lower, b_upper):
     opps = []
-    skip_mutex  = 0
-    skip_lowsum = 0
+    skip_mutex   = 0
+    skip_lowsum  = 0
+    skip_nested  = 0
     candidates = []
     for m in markets:
         prices = parse_prices(m)
@@ -557,6 +563,9 @@ def detect_cross_market(markets, b_lower, b_upper):
                 if is_mutually_exclusive(q1, q2):
                     skip_mutex += 1
                     continue
+                if has_numeric_threshold(q1) and has_numeric_threshold(q2):
+                    skip_nested += 1
+                    continue
                 edge = round(1.0 - total, 4)
                 if edge >= MIN_EDGE:
                     opps.append({
@@ -574,7 +583,7 @@ def detect_cross_market(markets, b_lower, b_upper):
                         "action": "BUY YES on both markets",
                         "common_keywords": list(common)[:5],
                     })
-    log.info("Cross-market: skipped " + str(skip_mutex) + " mutex + " + str(skip_lowsum) + " low-sum pairs")
+    log.info("Cross-market: skipped " + str(skip_mutex) + " mutex + " + str(skip_lowsum) + " low-sum + " + str(skip_nested) + " nested-threshold pairs")
     return opps
 
 
@@ -636,8 +645,12 @@ def detect_parent_child(markets):
     return opps
 
 
+# ----------------------------------------------------------------
+# detect_time_series (v6: +subject consistency check)
+# ----------------------------------------------------------------
 def detect_time_series(markets):
     opps = []
+    skip_no_subject = 0
     MONTHS = ["january","february","march","april","may","june",
               "july","august","september","october","november","december",
               "jan","feb","mar","apr","jun","jul","aug","sep","oct","nov","dec",
@@ -649,7 +662,7 @@ def detect_time_series(markets):
             q = m.get("question", "").lower()
             found_time = [t for t in MONTHS if t in q]
             if found_time:
-                stem = re.sub(r"[,\\.\\?!]", "", q)
+                stem = re.sub(r"[,\.\?!]", "", q)
                 for t in MONTHS:
                     stem = stem.replace(t, "").strip()
                 stem = " ".join(stem.split())
@@ -673,6 +686,13 @@ def detect_time_series(markets):
             for j in range(i + 1, len(group)):
                 m1, p1, t1 = group[i]
                 m2, p2, t2 = group[j]
+                q1 = m1.get("question", "")
+                q2 = m2.get("question", "")
+                s1 = extract_subjects(q1)
+                s2 = extract_subjects(q2)
+                if not (s1 & s2):
+                    skip_no_subject += 1
+                    continue
                 idx1 = MONTHS.index(t1) if t1 in MONTHS else 99
                 idx2 = MONTHS.index(t2) if t2 in MONTHS else 99
                 short_p = p1 if idx1 > idx2 else p2
@@ -695,6 +715,7 @@ def detect_time_series(markets):
                             "urgency": "WATCH",
                             "action": "SELL short-horizon YES + BUY long-horizon YES",
                         })
+    log.info("Time-series: skipped " + str(skip_no_subject) + " pairs with no common subject")
     return opps
 
 
@@ -831,11 +852,11 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
-    msg = "<b>Polymarket ARB Scanner v5 - " + str(len(push_opps)) + " alerts</b>\n"
+    msg = "<b>Polymarket ARB Scanner v6 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
     msg += "Markets scanned: " + str(total_markets) + "\n"
     msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "\n"
-    msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge<2% / mutex)\n"
+    msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge<2% / mutex / nested)\n"
     msg += "Thresholds: " + thresholds + "\n\n"
     for idx, opp in enumerate(push_opps[:5], 1):
         url = opp.get("url","#")
@@ -862,7 +883,7 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner v5 - mutex filter enabled")
+    log.info("Polymarket ARB Scanner v6 - time-series subject check + nested-threshold filter")
     log.info("MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN) + " CROSS_MIN_SUM=" + str(CROSS_MIN_SUM))
     log.info("Time: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     log.info("=" * 60)
@@ -946,12 +967,12 @@ def scan():
     if not push_opps:
         log.info("Nothing push-worthy this round")
         send_telegram(
-            "<b>Polymarket ARB Scanner v5</b>\n"
+            "<b>Polymarket ARB Scanner v6</b>\n"
             + "Time: " + now_str + "\n"
             + "Markets scanned: " + str(len(markets)) + "\n"
             + "Thresholds: " + thr_str + "\n"
             + "🔴 Urgent: 0  🟡 Watch(≥2%): 0\n"
-            + "Filtered (EARLY/low-edge/mutex): " + str(filtered_n) + "\n"
+            + "Filtered (EARLY/low-edge/mutex/nested): " + str(filtered_n) + "\n"
             + "Result: No high-priority opportunities"
         )
     else:
