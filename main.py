@@ -1,250 +1,355 @@
-import requests,os,time
+import os
+import time
+import requests
 from collections import defaultdict
 
-TELEGRAM_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # =========================
 # Telegram
 # =========================
 def send(msg):
     try:
-        url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url,json={"chat_id":CHAT_ID,"text":msg},timeout=5)
-    except: pass
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(
+            url,
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=5
+        )
+    except Exception as e:
+        print(f"[WARN] Telegram failed: {e}")
 
 # =========================
-# ✅ Extract YES Price (Dual API Format)
+# YES Price Parser (Dual Format)
 # =========================
 def get_yes_price(m):
+    try:
+        outcomes = m.get("outcomes")
 
-    # Format A
-    if isinstance(m.get("outcomes"),list):
-        for o in m["outcomes"]:
-            if isinstance(o,dict) and o.get("name","").lower()=="yes":
-                return float(o.get("price",0))
+        # Format A: list of dicts
+        if isinstance(outcomes, list):
+            for o in outcomes:
+                if isinstance(o, dict):
+                    name = str(o.get("name", "")).strip().lower()
+                    if name == "yes":
+                        return float(o.get("price", 0))
 
-    # Format B
-    elif isinstance(m.get("outcomes"),str):
+        # Format B: "Yes,No" + outcomePrices
+        if isinstance(outcomes, str):
+            names = [x.strip() for x in outcomes.split(",")]
+            prices_raw = str(m.get("outcomePrices", ""))
+            prices = [x.strip() for x in prices_raw.split(",")]
+            if len(names) == len(prices):
+                for i, name in enumerate(names):
+                    if name.lower() == "yes":
+                        return float(prices[i])
 
-        names=m["outcomes"].split(",")
-        prices=m.get("outcomePrices","").split(",")
+    except Exception as e:
+        print(f"[WARN] get_yes_price failed: {e}")
 
-        for i in range(len(names)):
-            if names[i].strip().lower()=="yes":
-                return float(prices[i])
+    return None
+
+# =========================
+# Group Key
+# Polymarket Partition 必须用 conditionId 分组
+# fallback 到 groupItemTitle
+# =========================
+def get_group_key(m):
+    cid = m.get("conditionId")
+    if cid:
+        return f"cid:{cid}"
+
+    g = m.get("groupItemTitle")
+    if g:
+        return f"group:{g}"
 
     return None
 
 # =========================
 # Deep Pagination
 # =========================
-def markets():
+def fetch_markets():
+    all_markets = []
 
-    all=[]
-
-    for i in range(0,2400,300):
-
+    for offset in range(0, 2400, 300):
         try:
-            r=requests.get(
+            r = requests.get(
                 "https://gamma-api.polymarket.com/markets",
-                params={"active":"true","limit":300,"offset":i},
-                headers={"User-Agent":"Mozilla/5.0"},
+                params={
+                    "active": "true",
+                    "limit": 300,
+                    "offset": offset
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
                 timeout=10
             )
 
-            if r.status_code==200:
-                data=r.json()
-                if len(data)==0:
-                    break
-                all+=data
-        except:
+            if r.status_code != 200:
+                print(f"[WARN] offset={offset} status={r.status_code}")
+                continue
+
+            data = r.json()
+
+            if not isinstance(data, list):
+                print(f"[WARN] offset={offset} unexpected type: {type(data)}")
+                continue
+
+            if len(data) == 0:
+                print(f"[INFO] offset={offset} empty page, stopping")
+                break
+
+            all_markets.extend(data)
+            print(f"[INFO] offset={offset} fetched={len(data)} total={len(all_markets)}")
+
+        except Exception as e:
+            print(f"[WARN] offset={offset} error: {e}")
             continue
 
-    return all
+    return all_markets
 
 # =========================
 # ⭐ Partition Arb
+# 关键：用 conditionId 分组
 # =========================
-def partition(ms):
+def partition_arb(markets):
+    found = False
+    groups = defaultdict(list)
 
-    groups=defaultdict(list)
-    found=False
-
-    for m in ms:
-
-        g=m.get("groupItemTitle")
-        if not g:continue
-
-        try:
-            liq=float(m["liquidity"])
-        except:
+    for m in markets:
+        key = get_group_key(m)
+        if not key:
             continue
 
-        if liq<500:continue
+        try:
+            liq = float(m.get("liquidity", 0))
+        except Exception:
+            continue
 
-        yes_price=get_yes_price(m)
+        if liq < 500:
+            continue
 
+        yes_price = get_yes_price(m)
         if yes_price is None:
             continue
 
-        groups[g].append((m,yes_price))
+        groups[key].append({
+            "question": m.get("question", ""),
+            "yes": yes_price,
+            "slug": m.get("slug", ""),
+            "conditionId": m.get("conditionId", ""),
+        })
 
-    for g in groups:
+    print(f"[INFO] partition groups: {len(groups)}")
 
-        if len(groups[g])<4:
+    for key, buckets in groups.items():
+
+        if len(buckets) < 4:
             continue
 
-        sum_yes=sum([p for _,p in groups[g]])
+        sum_yes = sum(b["yes"] for b in buckets)
 
-        if sum_yes>1.03:
+        print(f"[INFO] key={key} buckets={len(buckets)} sum_yes={round(sum_yes,4)}")
 
-            send(f"""
-🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
+        slug = buckets[0].get("slug", "")
+        url = f"https://polymarket.com/event/{slug}" if slug else ""
 
-Partition Arb (BUY ALL NO)
+        # ⭐ Overround: Σ YES > 1
+        if sum_yes > 1.03:
+            found = True
+            profit = round(sum_yes - 1, 4)
 
-Group:
-{g}
+            lines = [
+                "🚨🚨🚨 EXECUTE NOW 🚨🚨🚨",
+                "",
+                "Partition Arb → BUY ALL NO",
+                "",
+                f"Σ YES = {round(sum_yes, 4)}",
+                f"Profit ≈ {profit}",
+                "",
+                "Buckets:"
+            ]
 
-Σ YES={round(sum_yes,3)}
+            for b in buckets:
+                lines.append(f"  YES={round(b['yes'],3)}  {b['question'][:50]}")
 
-Profit≈{round(sum_yes-1,3)}
-""")
-            found=True
+            if url:
+                lines.append(f"\n🔗 {url}")
 
-        elif sum_yes<0.97:
+            send("\n".join(lines))
 
-            send(f"""
-🚨🚨🚨 EXECUTE NOW 🚨🚨🚨
+        # ⭐ Underround: Σ YES < 1
+        elif sum_yes < 0.97:
+            found = True
+            profit = round(1 - sum_yes, 4)
 
-Partition Arb (BUY ALL YES)
+            lines = [
+                "🚨🚨🚨 EXECUTE NOW 🚨🚨🚨",
+                "",
+                "Partition Arb → BUY ALL YES",
+                "",
+                f"Σ YES = {round(sum_yes, 4)}",
+                f"Profit ≈ {profit}",
+                "",
+                "Buckets:"
+            ]
 
-Group:
-{g}
+            for b in buckets:
+                lines.append(f"  YES={round(b['yes'],3)}  {b['question'][:50]}")
 
-Σ YES={round(sum_yes,3)}
+            if url:
+                lines.append(f"\n🔗 {url}")
 
-Profit≈{round(1-sum_yes,3)}
-""")
-            found=True
+            send("\n".join(lines))
 
     return found
 
 # =========================
-# Mutual Arb
+# Mutual Outcome Arb
 # =========================
-def mutual(ms):
+def mutual_arb(markets):
+    found = False
+    groups = defaultdict(list)
 
-    groups=defaultdict(list)
-    found=False
-
-    for m in ms:
-
-        g=m.get("groupItemTitle")
-        if not g:continue
-
-        try:
-            liq=float(m["liquidity"])
-        except:
+    for m in markets:
+        key = get_group_key(m)
+        if not key:
             continue
 
-        if liq<20000:continue
+        try:
+            liq = float(m.get("liquidity", 0))
+        except Exception:
+            continue
 
-        yes_price=get_yes_price(m)
+        if liq < 5000:
+            continue
 
+        yes_price = get_yes_price(m)
         if yes_price is None:
             continue
 
-        groups[g].append((m,yes_price))
+        groups[key].append({
+            "question": m.get("question", ""),
+            "yes": yes_price,
+            "slug": m.get("slug", ""),
+        })
 
-    for g in groups:
-        if len(groups[g])<3:continue
+    for key, items in groups.items():
 
-        s=sum([p for _,p in groups[g]])
+        if len(items) < 3:
+            continue
 
-        if s>1.02:
+        s = sum(i["yes"] for i in items)
 
-            slug=groups[g][0][0].get("slug")
-            if not slug:continue
+        if s > 1.05:
+            found = True
+            slug = items[0].get("slug", "")
+            url = f"https://polymarket.com/event/{slug}" if slug else ""
 
-            send(f"""
-🚨 EXECUTE NOW
+            lines = [
+                "⚠️ Mutual Outcome Arb",
+                "",
+                f"Σ YES = {round(s, 4)}",
+                f"Gap = {round(s-1, 4)}",
+                "",
+                "SELL all YES",
+                ""
+            ]
 
-Mutual Arb
-Σ YES={round(s,3)}
+            for i in items:
+                lines.append(f"  YES={round(i['yes'],3)}  {i['question'][:50]}")
 
-SELL all YES
+            if url:
+                lines.append(f"\n🔗 {url}")
 
-🔗 https://polymarket.com/event/{slug}
-""")
-            found=True
+            send("\n".join(lines))
 
     return found
 
 # =========================
 # Nomination Arb
 # =========================
-def nomination(ms):
+def nomination_arb(markets):
+    found = False
 
-    pres=[];nom=[]
-    found=False
+    pres = []
+    nom = []
 
-    for m in ms:
-
-        q=m.get("question","").lower()
+    for m in markets:
+        q = m.get("question", "").lower()
 
         try:
-            liq=float(m["liquidity"])
-        except:
+            liq = float(m.get("liquidity", 0))
+        except Exception:
             continue
 
-        if liq<20000:continue
+        if liq < 5000:
+            continue
 
-        yes_price=get_yes_price(m)
-
+        yes_price = get_yes_price(m)
         if yes_price is None:
             continue
 
-        if "president" in q: pres.append((m,yes_price))
-        if "nomination" in q or "primary" in q: nom.append((m,yes_price))
+        if "president" in q:
+            pres.append((m, yes_price))
 
-    for p in pres:
-        for n in nom:
+        if "nomination" in q or "primary" in q:
+            nom.append((m, yes_price))
 
-            if any(w in p[0]["question"].lower() for w in n[0]["question"].lower().split()):
+    for p_market, p_price in pres:
+        for n_market, n_price in nom:
 
-                gap=p[1]-n[1]
+            pq = p_market.get("question", "").lower()
+            nq = n_market.get("question", "").lower()
 
-                if gap>0.05:
+            # 必须包含至少 2 个相同词（排除 the/a/in/of 等）
+            stop = {"the","a","in","of","will","who","win","be","is","to","for","at","on","by"}
+            p_words = {w for w in pq.split() if len(w) > 2 and w not in stop}
+            n_words = {w for w in nq.split() if len(w) > 2 and w not in stop}
+            common = p_words & n_words
 
-                    slug=n[0].get("slug")
-                    if not slug:continue
+            if len(common) < 2:
+                continue
 
-                    send(f"""
-🚨 EXECUTE NOW
+            gap = p_price - n_price
 
-Nomination Arb
-Gap={round(gap,3)}
+            if gap > 0.05:
+                found = True
+                slug = n_market.get("slug", "")
+                url = f"https://polymarket.com/event/{slug}" if slug else ""
 
-BUY Nomination YES
-SELL Presidency YES
-
-🔗 https://polymarket.com/event/{slug}
-""")
-                    found=True
+                send(
+                    f"🚨 EXECUTE NOW\n\n"
+                    f"Nomination Arb\n"
+                    f"Gap = {round(gap, 3)}\n\n"
+                    f"Presidency: {p_market['question'][:60]}\n"
+                    f"YES = {round(p_price, 3)}\n\n"
+                    f"Nomination: {n_market['question'][:60]}\n"
+                    f"YES = {round(n_price, 3)}\n\n"
+                    f"BUY Nomination YES\n"
+                    f"SELL Presidency YES\n\n"
+                    f"🔗 {url}"
+                )
 
     return found
 
 # =========================
 # Run
 # =========================
-ms=markets()
+def main():
+    ts = int(time.time())
+    print(f"[START] ts={ts}")
 
-p=partition(ms)
-m1=mutual(ms)
-m2=nomination(ms)
+    markets = fetch_markets()
+    print(f"[INFO] total markets fetched: {len(markets)}")
 
-# ✅ 防 Telegram 吞消息
-if not p and not m1 and not m2:
-    send(f"✅ No Arb Found @ {int(time.time())}")
+    p = partition_arb(markets)
+    m1 = mutual_arb(markets)
+    m2 = nomination_arb(markets)
+
+    if not p and not m1 and not m2:
+        send(f"✅ No Arb Found @ {ts}")
+    else:
+        send(f"✅ Scan complete @ {ts}")
+
+main()
