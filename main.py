@@ -14,6 +14,34 @@ def send(msg):
     except: pass
 
 # =========================
+# ✅ Extract YES Price (Dual Format)
+# =========================
+def get_yes_price(m):
+
+    yes_price=None
+
+    # Format A
+    if isinstance(m.get("outcomes"),list):
+
+        for o in m["outcomes"]:
+            if isinstance(o,dict) and o.get("name","").lower()=="yes":
+                yes_price=float(o.get("price",0))
+                return yes_price
+
+    # Format B
+    elif isinstance(m.get("outcomes"),str):
+
+        names=m["outcomes"].split(",")
+        prices=m.get("outcomePrices","").split(",")
+
+        for i in range(len(names)):
+            if names[i].strip().lower()=="yes":
+                yes_price=float(prices[i])
+                return yes_price
+
+    return None
+
+# =========================
 # Deep Pagination
 # =========================
 def markets():
@@ -41,7 +69,7 @@ def markets():
     return all
 
 # =========================
-# ⭐ Partition Arb (FIXED)
+# ⭐ Partition Arb
 # =========================
 def partition(ms):
 
@@ -55,17 +83,12 @@ def partition(ms):
 
         try:
             liq=float(m["liquidity"])
-        except:continue
+        except:
+            continue
 
         if liq<500:continue
 
-        # ✅ 只取 YES
-        yes_price=None
-
-        for o in m["outcomes"]:
-            if o["name"].lower()=="yes":
-                yes_price=float(o["price"])
-                break
+        yes_price=get_yes_price(m)
 
         if yes_price is None:
             continue
@@ -91,7 +114,6 @@ Group:
 
 Σ YES={round(sum_yes,3)}
 
-BUY NO on ALL outcomes
 Profit≈{round(sum_yes-1,3)}
 """)
             found=True
@@ -108,7 +130,6 @@ Group:
 
 Σ YES={round(sum_yes,3)}
 
-BUY YES on ALL outcomes
 Profit≈{round(1-sum_yes,3)}
 """)
             found=True
@@ -121,121 +142,3 @@ Profit≈{round(1-sum_yes,3)}
 def mutual(ms):
 
     groups=defaultdict(list)
-    found=False
-
-    for m in ms:
-
-        g=m.get("groupItemTitle")
-        if not g:continue
-
-        try:
-            liq=float(m["liquidity"])
-        except:continue
-
-        if liq<20000:continue
-
-        yes_price=None
-
-        for o in m["outcomes"]:
-            if o["name"].lower()=="yes":
-                yes_price=float(o["price"])
-                break
-
-        if yes_price is None:
-            continue
-
-        groups[g].append((m,yes_price))
-
-    for g in groups:
-        if len(groups[g])<3:continue
-
-        s=sum([p for _,p in groups[g]])
-
-        if s>1.02:
-
-            slug=groups[g][0][0].get("slug")
-            if not slug:continue
-
-            send(f"""
-🚨 EXECUTE NOW
-
-Mutual Arb
-Σ YES={round(s,3)}
-
-SELL all YES
-
-🔗 https://polymarket.com/event/{slug}
-""")
-            found=True
-
-    return found
-
-# =========================
-# Nomination Arb
-# =========================
-def nomination(ms):
-
-    pres=[];nom=[]
-    found=False
-
-    for m in ms:
-
-        q=m.get("question","").lower()
-
-        try:
-            liq=float(m["liquidity"])
-        except:continue
-
-        if liq<20000:continue
-
-        yes_price=None
-
-        for o in m["outcomes"]:
-            if o["name"].lower()=="yes":
-                yes_price=float(o["price"])
-                break
-
-        if yes_price is None:
-            continue
-
-        if "president" in q: pres.append((m,yes_price))
-        if "nomination" in q or "primary" in q: nom.append((m,yes_price))
-
-    for p in pres:
-        for n in nom:
-
-            if any(w in p[0]["question"].lower() for w in n[0]["question"].lower().split()):
-
-                gap=p[1]-n[1]
-
-                if gap>0.05:
-
-                    slug=n[0].get("slug")
-                    if not slug:continue
-
-                    send(f"""
-🚨 EXECUTE NOW
-
-Nomination Arb
-Gap={round(gap,3)}
-
-BUY Nomination YES
-SELL Presidency YES
-
-🔗 https://polymarket.com/event/{slug}
-""")
-                    found=True
-
-    return found
-
-# =========================
-# Run
-# =========================
-ms=markets()
-
-p=partition(ms)
-m1=mutual(ms)
-m2=nomination(ms)
-
-if not p and not m1 and not m2:
-    send("✅ Hybrid scan complete - No Arb Found")
