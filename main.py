@@ -22,10 +22,33 @@ MAX_PAGES      = 50
 REQUEST_DELAY  = 0.3
 STD_MULTIPLIER = 2.0
 EXPIRY_WINDOW  = 168
-MIN_EDGE       = 0.01   # 1% minimum edge
-WATCH_PUSH_MIN = 0.02   # WATCH only pushed if edge > 2%
+MIN_EDGE       = 0.01
+WATCH_PUSH_MIN = 0.02
 SPREAD_SAMPLE  = 50
-CROSS_MIN_KEYS = 5      # tightened from 3 to 5
+CROSS_MIN_KEYS = 5
+CROSS_MIN_SUM  = 0.05
+
+COUNTRIES = {
+    "afghanistan","albania","algeria","argentina","australia","austria","azerbaijan",
+    "bahrain","bangladesh","belgium","bolivia","brazil","bulgaria","cambodia",
+    "canada","chile","china","colombia","croatia","cuba","czechia","denmark",
+    "ecuador","egypt","england","ethiopia","finland","france","germany","ghana",
+    "greece","guatemala","honduras","hungary","india","indonesia","iran","iraq",
+    "ireland","israel","italy","japan","jordan","kazakhstan","kenya","kuwait",
+    "malaysia","mexico","morocco","netherlands","nigeria","norway","pakistan",
+    "panama","peru","philippines","poland","portugal","qatar","romania","russia",
+    "saudi","scotland","senegal","serbia","singapore","slovakia","slovenia",
+    "somalia","spain","sweden","switzerland","taiwan","thailand","turkey",
+    "ukraine","uruguay","usa","venezuela","vietnam","wales",
+}
+
+EXCLUSIVE_EVENTS = {
+    "world cup","championship","election","president","oscar","nobel",
+    "champion","gold medal","title","award","winner","wins the","win the",
+    "super bowl","world series","stanley cup","nba finals","premier league",
+    "fa cup","champions league","ballon","mvp","best actor","best picture",
+}
+
 
 # ----------------------------------------------------------------
 # Logging
@@ -209,8 +232,46 @@ def hours_until_expiry(market):
 
 def tokenize(question):
     words = re.findall(r"[a-zA-Z0-9]+", question.lower())
-    stop = {"will","the","a","an","in","of","to","at","is","be","for","on","by","or","and","not","no","vs","who","what","when","does","would","have","has","did","this","that","their"}
+    stop = {"will","the","a","an","in","of","to","at","is","be","for","on","by","or",
+            "and","not","no","vs","who","what","when","does","would","have","has",
+            "did","this","that","their","2025","2026","2027","2028"}
     return set(w for w in words if w not in stop and len(w) > 2)
+
+
+def extract_subjects(question):
+    words = question.split()
+    caps = set()
+    for w in words:
+        cleaned = re.sub(r"[^a-zA-Z]", "", w)
+        if len(cleaned) > 1 and cleaned[0].isupper():
+            caps.add(cleaned.lower())
+    q_low = question.lower()
+    for c in COUNTRIES:
+        if c in q_low:
+            caps.add(c)
+    return caps
+
+
+def has_exclusive_event(q1, q2):
+    q1l = q1.lower()
+    q2l = q2.lower()
+    for event in EXCLUSIVE_EVENTS:
+        if event in q1l and event in q2l:
+            return True
+    return False
+
+
+def is_mutually_exclusive(q1, q2):
+    if not has_exclusive_event(q1, q2):
+        return False
+    s1 = extract_subjects(q1)
+    s2 = extract_subjects(q2)
+    common = s1 & s2
+    unique1 = s1 - common
+    unique2 = s2 - common
+    if len(unique1) >= 1 and len(unique2) >= 1:
+        return True
+    return False
 
 
 def is_push_worthy(opp):
@@ -445,10 +506,12 @@ def detect_clob_confirmed(market, threshold):
 
 
 # ----------------------------------------------------------------
-# ARB detectors - NEW (tightened matching)
+# ARB detectors - NEW (with mutex filter)
 # ----------------------------------------------------------------
 def detect_cross_market(markets, b_lower, b_upper):
     opps = []
+    skip_mutex  = 0
+    skip_lowsum = 0
     candidates = []
     for m in markets:
         prices = parse_prices(m)
@@ -488,6 +551,12 @@ def detect_cross_market(markets, b_lower, b_upper):
                         "common_keywords": list(common)[:5],
                     })
             elif total < b_lower:
+                if total < CROSS_MIN_SUM:
+                    skip_lowsum += 1
+                    continue
+                if is_mutually_exclusive(q1, q2):
+                    skip_mutex += 1
+                    continue
                 edge = round(1.0 - total, 4)
                 if edge >= MIN_EDGE:
                     opps.append({
@@ -505,6 +574,7 @@ def detect_cross_market(markets, b_lower, b_upper):
                         "action": "BUY YES on both markets",
                         "common_keywords": list(common)[:5],
                     })
+    log.info("Cross-market: skipped " + str(skip_mutex) + " mutex + " + str(skip_lowsum) + " low-sum pairs")
     return opps
 
 
@@ -761,11 +831,11 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
-    msg = "<b>Polymarket ARB Scanner - " + str(len(push_opps)) + " alerts</b>\n"
+    msg = "<b>Polymarket ARB Scanner v5 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
     msg += "Markets scanned: " + str(total_markets) + "\n"
     msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "\n"
-    msg += "Filtered out: " + str(filtered_n) + " (EARLY or edge<2%)\n"
+    msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge<2% / mutex)\n"
     msg += "Thresholds: " + thresholds + "\n\n"
     for idx, opp in enumerate(push_opps[:5], 1):
         url = opp.get("url","#")
@@ -792,7 +862,8 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner v4 - MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN))
+    log.info("Polymarket ARB Scanner v5 - mutex filter enabled")
+    log.info("MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN) + " CROSS_MIN_SUM=" + str(CROSS_MIN_SUM))
     log.info("Time: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     log.info("=" * 60)
 
@@ -861,7 +932,7 @@ def scan():
     log.info("DONE - " + str(len(opps)) + " total opportunities")
     log.info("  🔴 URGENT   : " + str(urgent_n) + "  (all pushed)")
     log.info("  🟡 WATCH    : " + str(watch_n) + "  (pushed if edge>=2%)")
-    log.info("  🟢 EARLY    : " + str(early_n) + "  (saved to file only)")
+    log.info("  🟢 EARLY    : " + str(early_n) + "  (file only)")
     log.info("  📤 Pushed   : " + str(pushed_n))
     log.info("  📁 Filtered : " + str(filtered_n))
     log.info("=" * 60)
@@ -875,12 +946,12 @@ def scan():
     if not push_opps:
         log.info("Nothing push-worthy this round")
         send_telegram(
-            "<b>Polymarket ARB Scanner</b>\n"
+            "<b>Polymarket ARB Scanner v5</b>\n"
             + "Time: " + now_str + "\n"
             + "Markets scanned: " + str(len(markets)) + "\n"
             + "Thresholds: " + thr_str + "\n"
             + "🔴 Urgent: 0  🟡 Watch(≥2%): 0\n"
-            + "Filtered (EARLY/low-edge): " + str(filtered_n) + "\n"
+            + "Filtered (EARLY/low-edge/mutex): " + str(filtered_n) + "\n"
             + "Result: No high-priority opportunities"
         )
     else:
@@ -891,6 +962,7 @@ def scan():
         "total_markets_scanned": len(markets),
         "min_edge_filter": MIN_EDGE,
         "watch_push_min": WATCH_PUSH_MIN,
+        "cross_min_sum": CROSS_MIN_SUM,
         "dynamic_thresholds": {
             "bundle":      round(b_thr,4),
             "multi_lower": round(m_low,4),
@@ -910,7 +982,7 @@ def scan():
     }
     with open("arb_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
-    log.info("report saved to arb_report.json (" + str(len(opps)) + " total, " + str(pushed_n) + " pushed)")
+    log.info("report saved -> " + str(len(opps)) + " total, " + str(pushed_n) + " pushed")
 
 
 if __name__ == "__main__":
