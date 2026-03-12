@@ -21,8 +21,8 @@ from typing import Optional
 # ──────────────────────────────────────────────────────────────
 GAMMA_API      = "https://gamma-api.polymarket.com"
 CLOB_API       = "https://clob.polymarket.com"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")       # GitHub Secret
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")     # GitHub Secret
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")   # ✅ 对应 GitHub Secret: TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")     # ✅ 对应 GitHub Secret: TELEGRAM_CHAT_ID
 
 # 套利阈值
 BUNDLE_ARB_THRESHOLD   = 0.97          # YES+NO 之和低于此值触发
@@ -143,7 +143,6 @@ def fetch_all_markets() -> list:
         if not data:
             break
 
-        # Gamma API 可能返回 list 或 {"data": list}
         if isinstance(data, list):
             batch = data
         elif isinstance(data, dict):
@@ -159,7 +158,7 @@ def fetch_all_markets() -> list:
         log.info("  已累计 {} 个市场".format(len(markets)))
 
         if len(batch) < PAGE_SIZE:
-            break  # 最后一页
+            break
 
         offset += PAGE_SIZE
         time.sleep(REQUEST_DELAY)
@@ -175,7 +174,6 @@ def parse_prices(market: dict) -> list:
     """解析市场中各 outcome 的价格，过滤掉 0 和 1 边界值。"""
     prices = []
 
-    # 方式1: outcomePrices 字段（可能是 JSON 字符串列表）
     raw = market.get("outcomePrices")
     if raw:
         try:
@@ -185,7 +183,6 @@ def parse_prices(market: dict) -> list:
         except Exception:
             pass
 
-    # 方式2: tokens 列表
     if not prices:
         tokens = market.get("tokens", [])
         prices = [float(t.get("price", 0)) for t in tokens if t.get("price") is not None]
@@ -335,7 +332,8 @@ def format_opportunity(opp: dict, idx: int) -> str:
     if "hours_left" in opp:
         lines.append("⏰ 距结算: {} 小时".format(opp["hours_left"]))
         lines.append("⚠️  异常价格: {}".format(opp["suspicious"]))
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 
 def build_telegram_message(opportunities: list, total_markets: int) -> str:
@@ -359,9 +357,10 @@ def build_telegram_message(opportunities: list, total_markets: int) -> str:
             lines.append("📊 价格: {}  合计: {}".format(price_list, opp["sum"]))
         if "hours_left" in opp:
             lines.append("⏰ 距结算: {}h".format(opp["hours_left"]))
-        lines.append("🔗 <a href=\"{}\">查看市场</a>".format(url))
+        lines.append('🔗 <a href="{}">查看市场</a>'.format(url))
         lines.append("")
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -421,8 +420,15 @@ def scan():
 
     if not opportunities:
         log.info("😴 本轮未发现套利机会")
-        send_telegram("😴 Polymarket 套利扫描完成（每15分钟），本轮无机会\n⏰ {}\n📦 共扫描: {} 个市场".format(
-            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), len(markets)))
+        send_telegram(
+            "😴 <b>Polymarket 套利扫描完成</b>\n"
+            "⏰ {}\n"
+            "📦 共扫描: {} 个市场\n"
+            "📭 本轮无套利机会".format(
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                len(markets)
+            )
+        )
     else:
         for idx, opp in enumerate(opportunities, 1):
             print(format_opportunity(opp, idx))
