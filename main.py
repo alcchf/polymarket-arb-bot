@@ -4,127 +4,140 @@ import os
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 获取所有活跃市场
+def send_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    requests.post(url, json=payload)
+
 def fetch_markets():
     url = "https://gamma-api.polymarket.com/markets"
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": 200
-    }
+    params = {"active": "true", "closed": "false", "limit": 300}
     response = requests.get(url, params=params)
     return response.json()
 
-# Telegram推送
-def send_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message
-    }
-    requests.post(url, json=payload)
+def detect_conditional(markets):
 
-# 判断是否为Conditional市场
-def is_conditional(question):
-    keywords = [
-        "if",
-        "assuming",
-        "provided that"
-    ]
-    q = question.lower()
-    return any(k in q for k in keywords)
-
-# 判断Base Market
-def is_base(question):
-    keywords = [
-        "approved",
-        "pass",
-        "win",
-        "launch",
-        "release"
-    ]
-    q = question.lower()
-    return any(k in q for k in keywords)
-
-# 主套利逻辑
-def detect_arbitrage(markets):
-
-    base_markets = []
-    conditional_markets = []
+    base = []
+    cond = []
 
     for m in markets:
         if not m.get("question"):
             continue
 
-        q = m["question"]
+        q = m["question"].lower()
 
         try:
-            yes_price = float(m["outcomes"][0]["price"])
-            liquidity = float(m["liquidity"])
+            price = float(m["outcomes"][0]["price"])
+            liq = float(m["liquidity"])
         except:
             continue
 
-        if liquidity < 30000:
+        if liq < 30000:
             continue
 
-        if is_conditional(q):
-            conditional_markets.append({
-                "question": q,
-                "price": yes_price
-            })
-        elif is_base(q):
-            base_markets.append({
-                "question": q,
-                "price": yes_price
-            })
+        if "if" in q:
+            cond.append({"q": q, "p": price})
+        elif any(k in q for k in ["approved","pass","release","launch"]):
+            base.append({"q": q, "p": price})
 
-    opportunities = []
+    ops = []
 
-    for c in conditional_markets:
-        for b in base_markets:
-
-            # 条件市场必须包含Base关键词
-            if any(word in c["question"].lower() for word in b["question"].lower().split()):
-
-                if c["price"] > b["price"]:
-
-                    gap = round(c["price"] - b["price"], 3)
-
+    for c in cond:
+        for b in base:
+            if any(word in c["q"] for word in b["q"].split()):
+                if c["p"] > b["p"]:
+                    gap = round(c["p"]-b["p"],3)
                     if gap > 0.05:
+                        ops.append(("CONDITIONAL",b,c,gap))
 
-                        opportunities.append({
-                            "base": b,
-                            "conditional": c,
-                            "gap": gap
-                        })
+    return ops
 
-    return opportunities
 
-# 运行
+def detect_release(markets):
+
+    release = []
+    announce = []
+
+    for m in markets:
+        if not m.get("question"):
+            continue
+
+        q = m["question"].lower()
+
+        try:
+            price = float(m["outcomes"][0]["price"])
+            liq = float(m["liquidity"])
+        except:
+            continue
+
+        if liq < 30000:
+            continue
+
+        if "release" in q:
+            release.append({"q": q, "p": price})
+        if "announce" in q:
+            announce.append({"q": q, "p": price})
+
+    ops = []
+
+    for r in release:
+        for a in announce:
+
+            if any(word in r["q"] for word in a["q"].split()):
+
+                if r["p"] > a["p"]:
+                    gap = round(r["p"]-a["p"],3)
+                    if gap > 0.05:
+                        ops.append(("RELEASE",a,r,gap))
+
+    return ops
+
+
 markets = fetch_markets()
-ops = detect_arbitrage(markets)
 
-if len(ops) == 0:
-    send_alert("✅ Bot ran successfully. No Logical Arb found today.")
+ops1 = detect_conditional(markets)
+ops2 = detect_release(markets)
+
+ops = ops1 + ops2
+
+if len(ops)==0:
+    send_alert("✅ Scan complete. No Logical Arb found.")
 else:
     for op in ops:
 
-        msg = f"""
-⚠️ Logical Arb Detected
+        if op[0]=="CONDITIONAL":
+            msg=f"""
+⚠️ Conditional Arb
 
-Base Market:
-{op['base']['question']}
-YES = {op['base']['price']}
+Base:
+{op[1]['q']}
+YES={op[1]['p']}
 
-Conditional Market:
-{op['conditional']['question']}
-YES = {op['conditional']['price']}
+Conditional:
+{op[2]['q']}
+YES={op[2]['p']}
 
-Violation:
-Conditional > Base by {op['gap']}
+Gap={op[3]}
 
-Suggested Trade:
 BUY Base YES
 SELL Conditional YES
 """
+        else:
+            msg=f"""
+⚠️ Release vs Announce Arb
+
+Announce:
+{op[1]['q']}
+YES={op[1]['p']}
+
+Release:
+{op[2]['q']}
+YES={op[2]['p']}
+
+Gap={op[3]}
+
+BUY Announce YES
+SELL Release YES
+"""
+
         send_alert(msg)
