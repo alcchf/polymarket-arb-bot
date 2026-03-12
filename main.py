@@ -16,17 +16,18 @@ CLOB_API       = "https://clob.polymarket.com"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-MIN_LIQUIDITY  = 100
-PAGE_SIZE      = 100
-MAX_PAGES      = 50
-REQUEST_DELAY  = 0.3
-STD_MULTIPLIER = 2.0
-EXPIRY_WINDOW  = 168
-MIN_EDGE       = 0.01
-WATCH_PUSH_MIN = 0.02
-SPREAD_SAMPLE  = 50
-CROSS_MIN_KEYS = 5
-CROSS_MIN_SUM  = 0.05
+MIN_LIQUIDITY     = 100
+PAGE_SIZE         = 100
+MAX_PAGES         = 50
+REQUEST_DELAY     = 0.3
+STD_MULTIPLIER    = 2.0
+EXPIRY_WINDOW     = 168
+MIN_EDGE          = 0.01
+WATCH_PUSH_MIN    = 0.02
+SPREAD_SAMPLE     = 50
+CROSS_MIN_KEYS    = 5
+CROSS_MIN_SUM     = 0.05
+SCAN_WINDOW_HOURS = 72
 
 COUNTRIES = {
     "afghanistan","albania","algeria","argentina","australia","austria","azerbaijan",
@@ -47,6 +48,14 @@ EXCLUSIVE_EVENTS = {
     "champion","gold medal","title","award","winner","wins the","win the",
     "super bowl","world series","stanley cup","nba finals","premier league",
     "fa cup","champions league","ballon","mvp","best actor","best picture",
+}
+
+SUBJECT_STOPWORDS = {
+    "will","won","win","the","his","her","their","this","that","who","what",
+    "when","how","does","did","can","could","would","should","may","might",
+    "shall","been","was","were","are","has","have","had","its","our","your",
+    "above","below","over","under","than","more","less","new","old","first",
+    "last","next","per","day","one","two","three","four","five",
 }
 
 
@@ -147,7 +156,7 @@ def clob_midprice_cached(token_id):
 
 
 # ----------------------------------------------------------------
-# Fetch all markets
+# Fetch all markets  (v7: filter to SCAN_WINDOW_HOURS)
 # ----------------------------------------------------------------
 def fetch_all_markets():
     markets = []
@@ -177,8 +186,15 @@ def fetch_all_markets():
             break
         offset += PAGE_SIZE
         time.sleep(REQUEST_DELAY)
-    log.info("total markets fetched: " + str(len(markets)))
-    return markets
+    total_raw = len(markets)
+    log.info("total markets fetched (raw): " + str(total_raw))
+    filtered = []
+    for m in markets:
+        h = hours_until_expiry(m)
+        if h is not None and h <= SCAN_WINDOW_HOURS:
+            filtered.append(m)
+    log.info("after " + str(SCAN_WINDOW_HOURS) + "h filter: " + str(len(filtered)) + " markets remain (from " + str(total_raw) + " total)")
+    return filtered
 
 
 # ----------------------------------------------------------------
@@ -243,7 +259,7 @@ def extract_subjects(question):
     caps = set()
     for w in words:
         cleaned = re.sub(r"[^a-zA-Z]", "", w)
-        if len(cleaned) > 1 and cleaned[0].isupper():
+        if len(cleaned) > 2 and cleaned[0].isupper() and cleaned.lower() not in SUBJECT_STOPWORDS:
             caps.add(cleaned.lower())
     q_low = question.lower()
     for c in COUNTRIES:
@@ -511,13 +527,13 @@ def detect_clob_confirmed(market, threshold):
 
 
 # ----------------------------------------------------------------
-# ARB detectors - cross-market (v6: +nested-threshold filter)
+# ARB detectors - cross-market (v6: mutex + nested filter)
 # ----------------------------------------------------------------
 def detect_cross_market(markets, b_lower, b_upper):
     opps = []
-    skip_mutex   = 0
-    skip_lowsum  = 0
-    skip_nested  = 0
+    skip_mutex  = 0
+    skip_lowsum = 0
+    skip_nested = 0
     candidates = []
     for m in markets:
         prices = parse_prices(m)
@@ -646,7 +662,7 @@ def detect_parent_child(markets):
 
 
 # ----------------------------------------------------------------
-# detect_time_series (v6: +subject consistency check)
+# detect_time_series (v6: subject consistency check)
 # ----------------------------------------------------------------
 def detect_time_series(markets):
     opps = []
@@ -852,9 +868,9 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
-    msg = "<b>Polymarket ARB Scanner v6 - " + str(len(push_opps)) + " alerts</b>\n"
+    msg = "<b>Polymarket ARB Scanner v7 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
-    msg += "Markets scanned: " + str(total_markets) + "\n"
+    msg += "Markets scanned (<=72h): " + str(total_markets) + "\n"
     msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "\n"
     msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge<2% / mutex / nested)\n"
     msg += "Thresholds: " + thresholds + "\n\n"
@@ -883,15 +899,15 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner v6 - time-series subject check + nested-threshold filter")
-    log.info("MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN) + " CROSS_MIN_SUM=" + str(CROSS_MIN_SUM))
+    log.info("Polymarket ARB Scanner v7 - 72h window + subject stopwords")
+    log.info("MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN) + " SCAN_WINDOW=" + str(SCAN_WINDOW_HOURS) + "h")
     log.info("Time: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     log.info("=" * 60)
 
     markets = fetch_all_markets()
     if not markets:
-        log.error("No markets fetched")
-        send_telegram("ERROR: Could not fetch markets")
+        log.error("No markets fetched or none within 72h window")
+        send_telegram("No markets within 72h window - nothing to scan")
         return
 
     log.info("Computing dynamic thresholds...")
@@ -902,7 +918,7 @@ def scan():
 
     log.info("Scanning " + str(len(markets)) + " markets...")
     for i, market in enumerate(markets):
-        if i % 500 == 0 and i > 0:
+        if i % 200 == 0 and i > 0:
             log.info("progress: {}/{}".format(i, len(markets)))
         r = detect_bundle(market, b_thr)
         if r:
@@ -967,9 +983,9 @@ def scan():
     if not push_opps:
         log.info("Nothing push-worthy this round")
         send_telegram(
-            "<b>Polymarket ARB Scanner v6</b>\n"
+            "<b>Polymarket ARB Scanner v7</b>\n"
             + "Time: " + now_str + "\n"
-            + "Markets scanned: " + str(len(markets)) + "\n"
+            + "Markets scanned (<=72h): " + str(len(markets)) + "\n"
             + "Thresholds: " + thr_str + "\n"
             + "🔴 Urgent: 0  🟡 Watch(≥2%): 0\n"
             + "Filtered (EARLY/low-edge/mutex/nested): " + str(filtered_n) + "\n"
@@ -980,6 +996,7 @@ def scan():
 
     report = {
         "scan_time": datetime.now(timezone.utc).isoformat(),
+        "scan_window_hours": SCAN_WINDOW_HOURS,
         "total_markets_scanned": len(markets),
         "min_edge_filter": MIN_EDGE,
         "watch_push_min": WATCH_PUSH_MIN,
