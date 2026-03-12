@@ -28,6 +28,7 @@ SPREAD_SAMPLE     = 50
 CROSS_MIN_KEYS    = 5
 CROSS_MIN_SUM     = 0.05
 SCAN_WINDOW_HOURS = 72
+MAX_CLOB_CONFIRM  = 20
 
 COUNTRIES = {
     "afghanistan","albania","algeria","argentina","australia","austria","azerbaijan",
@@ -71,26 +72,39 @@ log = logging.getLogger("PolyArb")
 
 
 # ----------------------------------------------------------------
-# Telegram
+# Telegram  (v7.1: auto-split messages > 4000 chars)
 # ----------------------------------------------------------------
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         log.info("[Telegram] not configured, skipping")
         return
     api_url = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
-    try:
-        resp = requests.post(api_url, json={
-            "chat_id": TELEGRAM_CHAT,
-            "text": msg,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=10)
-        if resp.status_code == 200:
-            log.info("[Telegram] sent ok")
-        else:
-            log.warning("[Telegram] failed: " + resp.text)
-    except Exception as ex:
-        log.warning("[Telegram] error: " + str(ex))
+    max_len = 4000
+    chunks = []
+    while len(msg) > max_len:
+        split_pos = msg.rfind("\n", 0, max_len)
+        if split_pos == -1:
+            split_pos = max_len
+        chunks.append(msg[:split_pos])
+        msg = msg[split_pos:].lstrip("\n")
+    chunks.append(msg)
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+        try:
+            resp = requests.post(api_url, json={
+                "chat_id": TELEGRAM_CHAT,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }, timeout=10)
+            if resp.status_code == 200:
+                log.info("[Telegram] sent ok (" + str(len(chunk)) + " chars)")
+            else:
+                log.warning("[Telegram] failed: " + resp.text)
+        except Exception as ex:
+            log.warning("[Telegram] error: " + str(ex))
+        time.sleep(0.5)
 
 
 # ----------------------------------------------------------------
@@ -394,7 +408,7 @@ def analyze_markets(markets):
 
 
 # ----------------------------------------------------------------
-# ARB detectors - existing
+# ARB detectors
 # ----------------------------------------------------------------
 def detect_bundle(market, threshold):
     prices = parse_prices(market)
@@ -527,7 +541,7 @@ def detect_clob_confirmed(market, threshold):
 
 
 # ----------------------------------------------------------------
-# ARB detectors - cross-market (v6: mutex + nested filter)
+# Cross-market detector
 # ----------------------------------------------------------------
 def detect_cross_market(markets, b_lower, b_upper):
     opps = []
@@ -662,7 +676,7 @@ def detect_parent_child(markets):
 
 
 # ----------------------------------------------------------------
-# detect_time_series (v6: subject consistency check)
+# Time-series detector
 # ----------------------------------------------------------------
 def detect_time_series(markets):
     opps = []
@@ -864,18 +878,22 @@ def fmt_opp(opp, idx):
     return out
 
 
+# ----------------------------------------------------------------
+# build_tg_msg  (v7.1: push up to 10 opps, concise format)
+# ----------------------------------------------------------------
 def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
     msg = "<b>Polymarket ARB Scanner v7 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
-    msg += "Markets scanned (<=72h): " + str(total_markets) + "\n"
+    msg += "Markets scanned (&lt;=72h): " + str(total_markets) + "\n"
     msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "\n"
-    msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge<2% / mutex / nested)\n"
+    msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge&lt;2% / mutex / nested)\n"
     msg += "Thresholds: " + thresholds + "\n\n"
-    for idx, opp in enumerate(push_opps[:5], 1):
-        url = opp.get("url","#")
+    for idx, opp in enumerate(push_opps[:10], 1):
+        url  = opp.get("url", "#")
+        url2 = opp.get("url2", "")
         msg += "<b>#" + str(idx) + " " + opp["type"] + "</b>\n"
         msg += opp.get("market","N/A")[:60] + "\n"
         msg += "Action: " + opp.get("action","N/A") + "\n"
@@ -888,9 +906,12 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
         msg += "Prices: " + str(opp.get("prices") or opp.get("prices_clob",[])) + "\n"
         if "hours_left" in opp:
             msg += "Expires: " + str(opp["hours_left"]) + "h\n"
-        msg += '<a href="' + url + '">View Market</a>\n\n'
-    if len(push_opps) > 5:
-        msg += "<i>... and " + str(len(push_opps) - 5) + " more in arb_report.json</i>\n"
+        msg += '<a href="' + url + '">URL1</a>'
+        if url2:
+            msg += '  <a href="' + url2 + '">URL2</a>'
+        msg += "\n\n"
+    if len(push_opps) > 10:
+        msg += "<i>... and " + str(len(push_opps) - 10) + " more in arb_report.json</i>\n"
     return msg
 
 
@@ -899,7 +920,7 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner v7 - 72h window + subject stopwords")
+    log.info("Polymarket ARB Scanner v7.1 - msg-split + 10-alert push")
     log.info("MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN) + " SCAN_WINDOW=" + str(SCAN_WINDOW_HOURS) + "h")
     log.info("Time: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     log.info("=" * 60)
@@ -934,7 +955,7 @@ def scan():
             opps.append(r)
 
     log.info("CLOB confirming " + str(len(bundle_candidates)) + " bundle candidates...")
-    for market, prelim in bundle_candidates:
+    for market, prelim in bundle_candidates[:MAX_CLOB_CONFIRM]:
         confirmed = detect_clob_confirmed(market, b_thr)
         opps.append(confirmed if confirmed else prelim)
         time.sleep(REQUEST_DELAY)
@@ -983,9 +1004,9 @@ def scan():
     if not push_opps:
         log.info("Nothing push-worthy this round")
         send_telegram(
-            "<b>Polymarket ARB Scanner v7</b>\n"
+            "<b>Polymarket ARB Scanner v7.1</b>\n"
             + "Time: " + now_str + "\n"
-            + "Markets scanned (<=72h): " + str(len(markets)) + "\n"
+            + "Markets scanned (&lt;=72h): " + str(len(markets)) + "\n"
             + "Thresholds: " + thr_str + "\n"
             + "🔴 Urgent: 0  🟡 Watch(≥2%): 0\n"
             + "Filtered (EARLY/low-edge/mutex/nested): " + str(filtered_n) + "\n"
