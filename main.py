@@ -165,7 +165,14 @@ def weather(ms):
     for m in ms:
 
         q=m.get("question","").lower()
-        if "temp" not in q:continue
+
+        if not any(k in q for k in [
+            "temp","temperature",
+            "reach","above",
+            "below","at least",
+            "high"
+        ]):
+            continue
 
         try:
             price=float(m["outcomes"][0]["price"])
@@ -178,12 +185,23 @@ def weather(ms):
         if not slug:continue
 
         match=re.search(r'(\d+)\s*-\s*(\d+)',q)
-        if not match:continue
+        single=re.search(r'(\d+)',q)
 
-        a=float(match.group(1))
-        b=float(match.group(2))
+        if match:
+            a=float(match.group(1))
+            b=float(match.group(2))
+            p=cdf(b,mean,std)-cdf(a,mean,std)
 
-        p=cdf(b,mean,std)-cdf(a,mean,std)
+        elif single:
+            t=float(single.group(1))
+            if "above" in q or "reach" in q or "at least" in q:
+                p=1-cdf(t,mean,std)
+            elif "below" in q:
+                p=cdf(t,mean,std)
+            else:
+                continue
+        else:
+            continue
 
         if p>price+.05:
 
@@ -196,7 +214,7 @@ def weather(ms):
             url=f"https://polymarket.com/event/{slug}"
 
             send(f"""
-🌦️ Ensemble Weather Arb
+🌦️ Binary / Bucket Weather Arb
 
 Market:
 {m['question']}
