@@ -2,14 +2,15 @@ name: Run Polymarket Arb Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # ⭐ 每15分钟运行一次（推荐）
-  workflow_dispatch:          # ⭐ 保留手动运行按钮
+    - cron: '*/5 * * * *'   # ⭐ 每 5 分钟自动运行一次
+  workflow_dispatch:         # ⭐ 保留手动运行按钮
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: ✅ Checkout Repo
         uses: actions/checkout@v3
 
@@ -23,9 +24,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: ✅ Run Bot
+      - name: ✅ Run Arb Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python main.py
+``
