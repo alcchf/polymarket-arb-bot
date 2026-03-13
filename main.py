@@ -68,6 +68,9 @@ WEATHER_KEYWORDS = [
     "temperature","rain","snow","hurricane","storm","wind","flood",
     "celsius","fahrenheit","precipitation","weather","degrees","hot",
     "cold","warm","freeze","blizzard","tornado","typhoon","cyclone",
+    "landfall","tropical","drought","heatwave","heat wave","exceed",
+    "reaches","high temp","low temp","record high","record low",
+    "snowfall","rainfall","mph","category","wildfire","heat",
 ]
 
 SPORTS_KEYWORDS = [
@@ -104,41 +107,54 @@ ODDS_SPORT_MAP = {
 }
 
 CITY_COORDS = {
-    "new york":     (40.71, -74.01),
-    "los angeles":  (34.05, -118.24),
-    "chicago":      (41.88, -87.63),
-    "houston":      (29.76, -95.37),
-    "miami":        (25.77, -80.19),
-    "london":       (51.51, -0.13),
-    "paris":        (48.85, 2.35),
-    "tokyo":        (35.69, 139.69),
-    "beijing":      (39.91, 116.39),
-    "sydney":       (-33.87, 151.21),
-    "dubai":        (25.20, 55.27),
-    "singapore":    (1.35, 103.82),
-    "toronto":      (43.65, -79.38),
-    "berlin":       (52.52, 13.41),
-    "moscow":       (55.75, 37.62),
-    "rome":         (41.90, 12.49),
-    "madrid":       (40.42, -3.70),
-    "amsterdam":    (52.37, 4.90),
-    "seoul":        (37.57, 126.98),
-    "mumbai":       (19.08, 72.88),
-    "cairo":        (30.04, 31.24),
-    "lagos":        (6.45, 3.39),
-    "sao paulo":    (-23.55, -46.63),
-    "mexico city":  (19.43, -99.13),
-    "buenos aires": (-34.60, -58.38),
-    "istanbul":     (41.01, 28.95),
-    "bangkok":      (13.75, 100.52),
-    "jakarta":      (-6.21, 106.85),
-    "manila":       (14.60, 120.98),
-    "karachi":      (24.86, 67.01),
-    "dallas":       (32.78, -96.80),
-    "seattle":      (47.61, -122.33),
-    "boston":       (42.36, -71.06),
-    "denver":       (39.74, -104.98),
-    "atlanta":      (33.75, -84.39),
+    "new york":      (40.71, -74.01),
+    "los angeles":   (34.05, -118.24),
+    "chicago":       (41.88, -87.63),
+    "houston":       (29.76, -95.37),
+    "miami":         (25.77, -80.19),
+    "london":        (51.51, -0.13),
+    "paris":         (48.85, 2.35),
+    "tokyo":         (35.69, 139.69),
+    "beijing":       (39.91, 116.39),
+    "sydney":        (-33.87, 151.21),
+    "dubai":         (25.20, 55.27),
+    "singapore":     (1.35, 103.82),
+    "toronto":       (43.65, -79.38),
+    "berlin":        (52.52, 13.41),
+    "moscow":        (55.75, 37.62),
+    "rome":          (41.90, 12.49),
+    "madrid":        (40.42, -3.70),
+    "amsterdam":     (52.37, 4.90),
+    "seoul":         (37.57, 126.98),
+    "mumbai":        (19.08, 72.88),
+    "cairo":         (30.04, 31.24),
+    "lagos":         (6.45, 3.39),
+    "sao paulo":     (-23.55, -46.63),
+    "mexico city":   (19.43, -99.13),
+    "buenos aires":  (-34.60, -58.38),
+    "istanbul":      (41.01, 28.95),
+    "bangkok":       (13.75, 100.52),
+    "jakarta":       (-6.21, 106.85),
+    "manila":        (14.60, 120.98),
+    "karachi":       (24.86, 67.01),
+    "dallas":        (32.78, -96.80),
+    "seattle":       (47.61, -122.33),
+    "boston":        (42.36, -71.06),
+    "denver":        (39.74, -104.98),
+    "atlanta":       (33.75, -84.39),
+    "nyc":           (40.71, -74.01),
+    "la":            (34.05, -118.24),
+    "sf":            (37.77, -122.42),
+    "san francisco": (37.77, -122.42),
+    "new orleans":   (29.95, -90.07),
+    "las vegas":     (36.17, -115.14),
+    "phoenix":       (33.45, -112.07),
+    "florida":       (27.99, -81.76),
+    "texas":         (31.00, -100.00),
+    "california":    (36.78, -119.42),
+    "midwest":       (41.88, -87.63),
+    "gulf coast":    (29.76, -95.37),
+    "northeast":     (42.36, -71.06),
 }
 
 # ----------------------------------------------------------------
@@ -152,7 +168,7 @@ logging.basicConfig(
 log = logging.getLogger("PolyArb")
 
 # ----------------------------------------------------------------
-# Telegram  (v8: auto-split messages > 4000 chars)
+# Telegram  (v8.1: auto-split messages > 4000 chars)
 # ----------------------------------------------------------------
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -243,7 +259,7 @@ def clob_midprice_cached(token_id):
     return p
 
 # ----------------------------------------------------------------
-# Fetch all markets  (v8: filter to SCAN_WINDOW_HOURS)
+# Fetch all markets
 # ----------------------------------------------------------------
 def fetch_all_markets():
     markets = []
@@ -309,10 +325,10 @@ def get_url(market):
 
 def get_urgency(hours_left):
     if hours_left < 6:
-        return "URGENT", "\U0001f534 URGENT"
+        return "URGENT", "🔴 URGENT"
     if hours_left < 72:
-        return "WATCH", "\U0001f7e1 WATCH"
-    return "EARLY", "\U0001f7e2 EARLY"
+        return "WATCH", "🟡 WATCH"
+    return "EARLY", "🟢 EARLY"
 
 def hours_until_expiry(market):
     end_date = market.get("endDate") or market.get("end_date_iso")
@@ -803,7 +819,7 @@ def detect_price_anchor(markets):
             if 0.2 <= p <= 0.8:
                 edge = round(min(p, 1 - p), 4)
                 opps.append({
-                    "type": "\U0001f534 URGENT Price Anchor ARB",
+                    "type": "🔴 URGENT Price Anchor ARB",
                     "market": market.get("question", market.get("slug", "N/A")),
                     "url": get_url(market),
                     "prices": prices,
@@ -883,7 +899,7 @@ def detect_info_arbitrage(markets):
     return opps
 
 # ----------------------------------------------------------------
-# Weather predictor (v8: Open-Meteo + NOAA key optional)
+# Weather predictor (v8.1: longest-match city scan)
 # ----------------------------------------------------------------
 def get_open_meteo_prob(lat, lon, condition, target_value):
     try:
@@ -935,32 +951,23 @@ def parse_weather_question(question):
     if not has_weather:
         return None
     city = None
-    for pattern in [r"in ([a-z ]+?)(?:\?|$| by| above| below| exceed)",
-                     r"for ([a-z ]+?)(?:\?|$| by| above| below| exceed)",
-                     r"at ([a-z ]+?)(?:\?|$| by| above| below| exceed),"]:
-        m = re.search(pattern, q_low)
-        if m:
-            candidate = m.group(1).strip()
-            if candidate in CITY_COORDS:
-                city = candidate
-                break
-    if city is None:
-        for c in CITY_COORDS:
-            if c in q_low:
-                city = c
-                break
+    best_len = 0
+    for c in CITY_COORDS:
+        if c in q_low and len(c) > best_len:
+            city = c
+            best_len = len(c)
     if city is None:
         return None
     num_match = re.search(r"(-?\d+\.?\d*)", question)
     threshold = float(num_match.group(1)) if num_match else 0.0
     condition = "temp_above"
-    if any(w in q_low for w in ["rain","precipitation","flood","snow","blizzard"]):
+    if any(w in q_low for w in ["rain","precipitation","flood","snow","blizzard","snowfall","rainfall"]):
         condition = "precip_above"
-    elif any(w in q_low for w in ["wind","storm","hurricane","typhoon","cyclone","tornado"]):
+    elif any(w in q_low for w in ["wind","storm","hurricane","typhoon","cyclone","tornado","mph","landfall"]):
         condition = "wind_above"
-    elif any(w in q_low for w in ["below","cold","freeze","freezing"]):
+    elif any(w in q_low for w in ["below","cold","freeze","freezing","low temp","record low"]):
         condition = "temp_below"
-    elif any(w in q_low for w in ["above","exceed","hot","warm","high"]):
+    elif any(w in q_low for w in ["above","exceed","hot","warm","high","heat","reaches","record high","heatwave"]):
         condition = "temp_above"
     return {"city": city, "condition": condition, "threshold": threshold}
 
@@ -989,7 +996,7 @@ def detect_weather_markets(markets):
         if edge < WEATHER_EDGE_MIN:
             continue
         h = hours_until_expiry(market)
-        urgency_key, urgency_label = get_urgency(h) if h else ("WATCH", "\U0001f7e1 WATCH")
+        urgency_key, urgency_label = get_urgency(h) if h else ("WATCH", "🟡 WATCH")
         direction = "BUY YES" if model_prob > market_price else "BUY NO"
         confidence = "HIGH" if edge > 0.20 else "MEDIUM"
         opps.append({
@@ -1014,7 +1021,7 @@ def detect_weather_markets(markets):
     return opps
 
 # ----------------------------------------------------------------
-# Sports predictor (v8: The Odds API)
+# Sports predictor (v8.1: The Odds API)
 # ----------------------------------------------------------------
 _odds_cache = {}
 
@@ -1146,7 +1153,7 @@ def detect_sports_markets(markets):
                 if edge > best_edge:
                     best_edge = edge
                     h = hours_until_expiry(market)
-                    urgency_key, urgency_label = get_urgency(h) if h else ("WATCH", "\U0001f7e1 WATCH")
+                    urgency_key, urgency_label = get_urgency(h) if h else ("WATCH", "🟡 WATCH")
                     direction = "BUY YES" if implied_prob > market_price else "BUY NO"
                     confidence = "HIGH" if edge > 0.10 else "MEDIUM"
                     home = game.get("home_team", "")
@@ -1214,17 +1221,14 @@ def fmt_opp(opp, idx):
         out += "Keywords  : " + str(opp["common_keywords"]) + "\n"
     return out
 
-# ----------------------------------------------------------------
-# build_tg_msg  (v8: weather/sports extra line)
-# ----------------------------------------------------------------
 def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
-    msg = "<b>Polymarket ARB Scanner v8 - " + str(len(push_opps)) + " alerts</b>\n"
+    msg = "<b>Polymarket ARB Scanner v8.1 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
     msg += "Markets scanned (&lt;=72h): " + str(total_markets) + "\n"
-    msg += "\U0001f534 Urgent: " + str(urgent_n) + "  \U0001f7e1 Watch(\u22652%): " + str(watch_n) + "\n"
+    msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "\n"
     msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge&lt;2% / mutex / nested)\n"
     msg += "Thresholds: " + thresholds + "\n\n"
     for idx, opp in enumerate(push_opps[:10], 1):
@@ -1261,7 +1265,7 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner v8 - weather + sports modules")
+    log.info("Polymarket ARB Scanner v8.1 - weather longest-match fix")
     log.info("MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN) + " SCAN_WINDOW=" + str(SCAN_WINDOW_HOURS) + "h")
     log.info("NOAA_KEY=" + ("SET" if NOAA_API_KEY else "NOT SET") + "  ODDS_KEY=" + ("SET" if ODDS_API_KEY else "NOT SET"))
     log.info("WEATHER_EDGE=" + str(WEATHER_EDGE_MIN) + "  SPORTS_EDGE=" + str(SPORTS_EDGE_MIN))
@@ -1336,11 +1340,11 @@ def scan():
 
     log.info("=" * 60)
     log.info("DONE - " + str(len(opps)) + " total opportunities")
-    log.info("  \U0001f534 URGENT   : " + str(urgent_n) + "  (all pushed)")
-    log.info("  \U0001f7e1 WATCH    : " + str(watch_n) + "  (pushed if edge>=2%)")
-    log.info("  \U0001f7e2 EARLY    : " + str(early_n) + "  (file only)")
-    log.info("  \U0001f4e4 Pushed   : " + str(pushed_n))
-    log.info("  \U0001f4c1 Filtered : " + str(filtered_n))
+    log.info("  🔴 URGENT   : " + str(urgent_n) + "  (all pushed)")
+    log.info("  🟡 WATCH    : " + str(watch_n) + "  (pushed if edge>=2%)")
+    log.info("  🟢 EARLY    : " + str(early_n) + "  (file only)")
+    log.info("  📤 Pushed   : " + str(pushed_n))
+    log.info("  📁 Filtered : " + str(filtered_n))
     log.info("=" * 60)
 
     thr_str = "B=" + str(round(b_thr,4)) + " ML=" + str(round(m_low,4)) + " MH=" + str(round(m_high,4)) + " E=" + str(round(e_thr,4))
@@ -1352,11 +1356,11 @@ def scan():
     if not push_opps:
         log.info("Nothing push-worthy this round")
         send_telegram(
-            "<b>Polymarket ARB Scanner v8</b>\n"
+            "<b>Polymarket ARB Scanner v8.1</b>\n"
             + "Time: " + now_str + "\n"
             + "Markets scanned (&lt;=72h): " + str(len(markets)) + "\n"
             + "Thresholds: " + thr_str + "\n"
-            + "\U0001f534 Urgent: 0  \U0001f7e1 Watch(\u22652%): 0\n"
+            + "🔴 Urgent: 0  🟡 Watch(≥2%): 0\n"
             + "Filtered (EARLY/low-edge/mutex/nested): " + str(filtered_n) + "\n"
             + "Result: No high-priority opportunities"
         )
