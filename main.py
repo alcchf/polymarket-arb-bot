@@ -35,6 +35,12 @@ MAX_CLOB_CONFIRM  = 20
 WEATHER_EDGE_MIN  = 0.12
 SPORTS_EDGE_MIN   = 0.05
 
+DIRECTIONAL_EDGE_MIN = 0.07
+DIRECTIONAL_WINDOW   = 72
+WHALE_MIN_SIZE       = 500
+WHALE_LOOKBACK       = 3600
+WHALE_TOP_N          = 5
+
 COUNTRIES = {
     "afghanistan","albania","algeria","argentina","australia","austria","azerbaijan",
     "bahrain","bangladesh","belgium","bolivia","brazil","bulgaria","cambodia",
@@ -168,7 +174,7 @@ logging.basicConfig(
 log = logging.getLogger("PolyArb")
 
 # ----------------------------------------------------------------
-# Telegram  (v8.1: auto-split messages > 4000 chars)
+# Telegram  (v9.0: auto-split messages > 4000 chars)
 # ----------------------------------------------------------------
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -899,7 +905,131 @@ def detect_info_arbitrage(markets):
     return opps
 
 # ----------------------------------------------------------------
-# Weather predictor (v8.1: longest-match city scan)
+# Whale trade monitor + Directional scanner (v9.0)
+# ----------------------------------------------------------------
+def fetch_clob_trades(token_id, limit=50):
+    """Fetch recent trades for a CLOB token via the REST endpoint."""
+    try:
+        r = SESSION.get(
+            CLOB_API + "/trades",
+            params={"token_id": token_id, "limit": limit},
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        return data.get("data", [])
+    except Exception as ex:
+        log.warning("fetch_clob_trades error: " + str(ex))
+        return []
+
+
+def detect_whale_trades(markets):
+    """
+    Scan recent CLOB trades for large (>= WHALE_MIN_SIZE USD) activity
+    within WHALE_LOOKBACK seconds.  Returns the top WHALE_TOP_N markets
+    ranked by absolute net flow (buy - sell).
+    """
+    now_ts = time.time()
+    results = []
+    for market in markets:
+        tokens = market.get("tokens", [])
+        if len(tokens) != 2:
+            continue
+        tid = tokens[0].get("token_id") or tokens[0].get("tokenId")
+        if not tid:
+            continue
+        trades = fetch_clob_trades(tid, limit=50)
+        buy_usd = 0.0
+        sell_usd = 0.0
+        for t in trades:
+            try:
+                ts = float(t.get("timestamp", 0))
+                if now_ts - ts > WHALE_LOOKBACK:
+                    continue
+                size = float(t.get("size", 0))
+                price = float(t.get("price", 0))
+                usd_val = size * price
+                if usd_val < WHALE_MIN_SIZE:
+                    continue
+                side = str(t.get("side", "")).upper()
+                if side == "BUY":
+                    buy_usd += usd_val
+                else:
+                    sell_usd += usd_val
+            except Exception:
+                continue
+        net_flow = round(buy_usd - sell_usd, 2)
+        if abs(net_flow) < WHALE_MIN_SIZE:
+            continue
+        whale_dir = "BUY YES" if net_flow > 0 else "BUY NO"
+        prices = parse_prices(market)
+        h = hours_until_expiry(market)
+        urgency_key, urgency_label = get_urgency(h) if h else ("WATCH", "🟡 WATCH")
+        results.append({
+            "type": urgency_label + " Whale Trade Signal",
+            "market": market.get("question", market.get("slug", "N/A")),
+            "url": get_url(market),
+            "prices": prices,
+            "net_flow_usd": net_flow,
+            "whale_direction": whale_dir,
+            "buy_usd": round(buy_usd, 2),
+            "sell_usd": round(sell_usd, 2),
+            "edge": round(abs(net_flow) / max(buy_usd + sell_usd, 1), 4),
+            "liquidity": market.get("liquidity", "N/A"),
+            "threshold_used": WHALE_MIN_SIZE,
+            "urgency": urgency_key,
+            "action": whale_dir,
+            "hours_left": round(h, 2) if h else None,
+        })
+        time.sleep(0.15)
+    results.sort(key=lambda x: -abs(x["net_flow_usd"]))
+    log.info("Whale monitor: " + str(len(results)) + " whale signals found")
+    return results[:WHALE_TOP_N]
+
+
+def detect_directional(markets):
+    """
+    Flag binary markets where abs(yes_price - 0.5) >= DIRECTIONAL_EDGE_MIN
+    and expiry is within DIRECTIONAL_WINDOW hours.  Returns up to 30 markets
+    sorted by distance from 0.5 (strongest conviction first).
+    """
+    results = []
+    for market in markets:
+        h = hours_until_expiry(market)
+        if h is None or h > DIRECTIONAL_WINDOW:
+            continue
+        prices = parse_prices(market)
+        if len(prices) != 2:
+            continue
+        yes_price = prices[0]
+        dist = abs(yes_price - 0.5)
+        if dist < DIRECTIONAL_EDGE_MIN:
+            continue
+        direction = "BUY YES" if yes_price > 0.5 else "BUY NO"
+        urgency_key, urgency_label = get_urgency(h)
+        results.append({
+            "type": urgency_label + " Directional Signal",
+            "market": market.get("question", market.get("slug", "N/A")),
+            "url": get_url(market),
+            "prices": prices,
+            "yes_price": round(yes_price, 4),
+            "edge": round(dist, 4),
+            "edge_pct": "{:.2f}%".format(dist * 100),
+            "liquidity": market.get("liquidity", "N/A"),
+            "threshold_used": DIRECTIONAL_EDGE_MIN,
+            "urgency": urgency_key,
+            "action": direction,
+            "hours_left": round(h, 2),
+        })
+    results.sort(key=lambda x: -x["edge"])
+    log.info("Directional scanner: " + str(len(results)) + " signals found")
+    return results[:30]
+
+
+# ----------------------------------------------------------------
+# Weather predictor (v9.0: longest-match city scan)
 # ----------------------------------------------------------------
 def get_open_meteo_prob(lat, lon, condition, target_value):
     try:
@@ -1021,7 +1151,7 @@ def detect_weather_markets(markets):
     return opps
 
 # ----------------------------------------------------------------
-# Sports predictor (v8.1: The Odds API)
+# Sports predictor (v9.0: The Odds API)
 # ----------------------------------------------------------------
 _odds_cache = {}
 
@@ -1098,17 +1228,19 @@ def get_best_market_prob(game, team_name):
 
 def parse_sports_question(question):
     q_low = question.lower()
-    sport_key = None
-    for kw in ODDS_SPORT_MAP:
+    # Sort keys longest-first to get most-specific match first
+    sport_keys = []
+    for kw in sorted(ODDS_SPORT_MAP.keys(), key=len, reverse=True):
         if kw in q_low:
-            sport_key = ODDS_SPORT_MAP[kw]
-            break
-    if sport_key is None:
+            sk = ODDS_SPORT_MAP[kw]
+            if sk not in sport_keys:
+                sport_keys.append(sk)
+    if not sport_keys:
         for kw in SPORTS_KEYWORDS:
             if kw in q_low:
-                sport_key = "americanfootball_nfl"
+                sport_keys.append("americanfootball_nfl")
                 break
-    if sport_key is None:
+    if not sport_keys:
         return None, []
     words = question.split()
     teams = []
@@ -1116,7 +1248,7 @@ def parse_sports_question(question):
         cleaned = re.sub(r"[^a-zA-Z]", "", w)
         if len(cleaned) > 2 and cleaned[0].isupper() and cleaned.lower() not in SUBJECT_STOPWORDS:
             teams.append(cleaned)
-    return sport_key, teams
+    return sport_keys, teams
 
 def detect_sports_markets(markets):
     if not ODDS_API_KEY:
@@ -1126,11 +1258,16 @@ def detect_sports_markets(markets):
     scanned = 0
     for market in markets:
         q = market.get("question", "")
-        sport_key, teams = parse_sports_question(q)
-        if sport_key is None:
+        sport_keys, teams = parse_sports_question(q)
+        if not sport_keys:
             continue
         scanned += 1
-        games = get_odds_for_sport(sport_key)
+        # Merge games from all matched sport keys, dedup by game id
+        games_by_id = {}
+        for sk in sport_keys:
+            for g in get_odds_for_sport(sk):
+                games_by_id[g.get("id", id(g))] = g
+        games = list(games_by_id.values())
         if not games:
             continue
         prices = parse_prices(market)
@@ -1208,6 +1345,11 @@ def fmt_opp(opp, idx):
         out += "Matchup   : " + opp["matchup"] + "\n"
     if "confidence" in opp:
         out += "Confidence: " + opp["confidence"] + "\n"
+    if "net_flow_usd" in opp:
+        out += "Net Flow  : $" + str(opp["net_flow_usd"]) + "  (" + opp.get("whale_direction", "N/A") + ")\n"
+        out += "Buy/Sell  : $" + str(opp.get("buy_usd", 0)) + " / $" + str(opp.get("sell_usd", 0)) + "\n"
+    if "yes_price" in opp:
+        out += "YES Price : " + str(opp["yes_price"]) + "\n"
     if "overround" in opp:
         out += "Sum       : " + str(opp["sum"]) + "  Overround: " + opp.get("overround_pct","N/A") + "\n"
     elif "spread" in opp:
@@ -1225,10 +1367,10 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
-    msg = "<b>Polymarket ARB Scanner v8.1 - " + str(len(push_opps)) + " alerts</b>\n"
+    msg = "<b>Polymarket ARB Scanner v9.0 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
     msg += "Markets scanned (&lt;=72h): " + str(total_markets) + "\n"
-    msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "\n"
+    msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "  📈 Directional: " + str(directional_n) + "  🐳 Whale: " + str(whale_n) + "\n"
     msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge&lt;2% / mutex / nested)\n"
     msg += "Thresholds: " + thresholds + "\n\n"
     for idx, opp in enumerate(push_opps[:10], 1):
@@ -1245,6 +1387,10 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
             msg += "Overround: " + opp["overround_pct"] + "  Sum: " + str(opp["sum"]) + "\n"
         elif "spread" in opp:
             msg += "Spread: " + str(opp["spread"]) + "  Mid: " + str(opp.get("midpoint","")) + "\n"
+        elif "net_flow_usd" in opp:
+            msg += "Net Flow: $" + str(opp["net_flow_usd"]) + "  " + opp.get("whale_direction","N/A") + "\n"
+        elif "yes_price" in opp:
+            msg += "YES Price: " + str(opp["yes_price"]) + "  Edge: " + opp.get("edge_pct","N/A") + "\n"
         else:
             msg += "Edge: " + opp.get("edge_pct","N/A") + "\n"
         if "confidence" in opp:
@@ -1265,10 +1411,11 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner v8.1 - weather longest-match fix")
+    log.info("Polymarket ARB Scanner v9.0 - weather longest-match fix")
     log.info("MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN) + " SCAN_WINDOW=" + str(SCAN_WINDOW_HOURS) + "h")
     log.info("NOAA_KEY=" + ("SET" if NOAA_API_KEY else "NOT SET") + "  ODDS_KEY=" + ("SET" if ODDS_API_KEY else "NOT SET"))
     log.info("WEATHER_EDGE=" + str(WEATHER_EDGE_MIN) + "  SPORTS_EDGE=" + str(SPORTS_EDGE_MIN))
+    log.info("DIRECTIONAL_EDGE=" + str(DIRECTIONAL_EDGE_MIN) + "  WHALE_MIN=$" + str(WHALE_MIN_SIZE) + "  WHALE_LOOKBACK=" + str(WHALE_LOOKBACK) + "s  WHALE_TOP_N=" + str(WHALE_TOP_N))
     log.info("Time: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     log.info("=" * 60)
 
@@ -1314,9 +1461,13 @@ def scan():
     opps += detect_price_anchor(markets)
     opps += detect_liquidity_spread(markets, sp_thr)
     opps += detect_info_arbitrage(markets)
+    log.info("Running directional scanner...")
+    opps += detect_directional(markets)
 
     log.info("Running weather predictor...")
     opps += detect_weather_markets(markets)
+    log.info("Running whale trade monitor...")
+    opps += detect_whale_trades(markets)
     log.info("Running sports predictor...")
     opps += detect_sports_markets(markets)
 
@@ -1356,7 +1507,7 @@ def scan():
     if not push_opps:
         log.info("Nothing push-worthy this round")
         send_telegram(
-            "<b>Polymarket ARB Scanner v8.1</b>\n"
+            "<b>Polymarket ARB Scanner v9.0</b>\n"
             + "Time: " + now_str + "\n"
             + "Markets scanned (&lt;=72h): " + str(len(markets)) + "\n"
             + "Thresholds: " + thr_str + "\n"
