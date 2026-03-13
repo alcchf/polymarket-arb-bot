@@ -11,10 +11,13 @@ from collections import defaultdict
 # ----------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------
-GAMMA_API      = "https://gamma-api.polymarket.com"
-CLOB_API       = "https://clob.polymarket.com"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+GAMMA_API         = "https://gamma-api.polymarket.com"
+CLOB_API          = "https://clob.polymarket.com"
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT     = os.getenv("TELEGRAM_CHAT_ID", "")
+NOAA_API_KEY      = os.getenv("NOAA_API_KEY", "")
+ODDS_API_KEY      = os.getenv("ODDS_API_KEY", "")
+ODDS_API_BASE     = "https://api.the-odds-api.com/v4"
 
 MIN_LIQUIDITY     = 100
 PAGE_SIZE         = 100
@@ -29,6 +32,8 @@ CROSS_MIN_KEYS    = 5
 CROSS_MIN_SUM     = 0.05
 SCAN_WINDOW_HOURS = 72
 MAX_CLOB_CONFIRM  = 20
+WEATHER_EDGE_MIN  = 0.12
+SPORTS_EDGE_MIN   = 0.05
 
 COUNTRIES = {
     "afghanistan","albania","algeria","argentina","australia","austria","azerbaijan",
@@ -59,6 +64,82 @@ SUBJECT_STOPWORDS = {
     "last","next","per","day","one","two","three","four","five",
 }
 
+WEATHER_KEYWORDS = [
+    "temperature","rain","snow","hurricane","storm","wind","flood",
+    "celsius","fahrenheit","precipitation","weather","degrees","hot",
+    "cold","warm","freeze","blizzard","tornado","typhoon","cyclone",
+]
+
+SPORTS_KEYWORDS = [
+    "nfl","nba","mlb","nhl","soccer","football","basketball","baseball",
+    "hockey","tennis","ufc","mma","boxing","golf","rugby","cricket",
+    "f1","formula","premier league","champions league","la liga","serie a",
+    "bundesliga","ligue 1","world cup","euros","copa","superbowl","super bowl",
+    "playoffs","championship","match","game","vs","versus","beat","defeat",
+]
+
+ODDS_SPORT_MAP = {
+    "nfl":              "americanfootball_nfl",
+    "nba":              "basketball_nba",
+    "mlb":              "baseball_mlb",
+    "nhl":              "icehockey_nhl",
+    "premier league":   "soccer_epl",
+    "champions league": "soccer_uefa_champs_league",
+    "la liga":          "soccer_spain_la_liga",
+    "serie a":          "soccer_italy_serie_a",
+    "bundesliga":       "soccer_germany_bundesliga",
+    "ligue 1":          "soccer_france_ligue_one",
+    "soccer":           "soccer_epl",
+    "football":         "americanfootball_nfl",
+    "basketball":       "basketball_nba",
+    "baseball":         "baseball_mlb",
+    "hockey":           "icehockey_nhl",
+    "ufc":              "mma_mixed_martial_arts",
+    "mma":              "mma_mixed_martial_arts",
+    "tennis":           "tennis_atp_french_open",
+    "golf":             "golf_masters_tournament_winner",
+    "super bowl":       "americanfootball_nfl",
+    "superbowl":        "americanfootball_nfl",
+    "world cup":        "soccer_fifa_world_cup",
+}
+
+CITY_COORDS = {
+    "new york":     (40.71, -74.01),
+    "los angeles":  (34.05, -118.24),
+    "chicago":      (41.88, -87.63),
+    "houston":      (29.76, -95.37),
+    "miami":        (25.77, -80.19),
+    "london":       (51.51, -0.13),
+    "paris":        (48.85, 2.35),
+    "tokyo":        (35.69, 139.69),
+    "beijing":      (39.91, 116.39),
+    "sydney":       (-33.87, 151.21),
+    "dubai":        (25.20, 55.27),
+    "singapore":    (1.35, 103.82),
+    "toronto":      (43.65, -79.38),
+    "berlin":       (52.52, 13.41),
+    "moscow":       (55.75, 37.62),
+    "rome":         (41.90, 12.49),
+    "madrid":       (40.42, -3.70),
+    "amsterdam":    (52.37, 4.90),
+    "seoul":        (37.57, 126.98),
+    "mumbai":       (19.08, 72.88),
+    "cairo":        (30.04, 31.24),
+    "lagos":        (6.45, 3.39),
+    "sao paulo":    (-23.55, -46.63),
+    "mexico city":  (19.43, -99.13),
+    "buenos aires": (-34.60, -58.38),
+    "istanbul":     (41.01, 28.95),
+    "bangkok":      (13.75, 100.52),
+    "jakarta":      (-6.21, 106.85),
+    "manila":       (14.60, 120.98),
+    "karachi":      (24.86, 67.01),
+    "dallas":       (32.78, -96.80),
+    "seattle":      (47.61, -122.33),
+    "boston":       (42.36, -71.06),
+    "denver":       (39.74, -104.98),
+    "atlanta":      (33.75, -84.39),
+}
 
 # ----------------------------------------------------------------
 # Logging
@@ -70,9 +151,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("PolyArb")
 
-
 # ----------------------------------------------------------------
-# Telegram  (v7.1: auto-split messages > 4000 chars)
+# Telegram  (v8: auto-split messages > 4000 chars)
 # ----------------------------------------------------------------
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -106,13 +186,11 @@ def send_telegram(msg):
             log.warning("[Telegram] error: " + str(ex))
         time.sleep(0.5)
 
-
 # ----------------------------------------------------------------
 # HTTP session
 # ----------------------------------------------------------------
 SESSION = requests.Session()
 SESSION.headers.update({"Accept": "application/json"})
-
 
 # ----------------------------------------------------------------
 # API helpers
@@ -125,7 +203,6 @@ def gamma_get(path, params=None):
     except Exception as ex:
         log.warning("Gamma API error " + path + ": " + str(ex))
         return None
-
 
 def clob_get_spread(token_id):
     try:
@@ -141,7 +218,6 @@ def clob_get_spread(token_id):
     except Exception:
         return None, None
 
-
 def clob_midprice(token_id):
     try:
         rb = SESSION.get(CLOB_API + "/price",
@@ -156,9 +232,7 @@ def clob_midprice(token_id):
     except Exception:
         return None
 
-
 _cache = {}
-
 
 def clob_midprice_cached(token_id):
     if token_id in _cache:
@@ -168,9 +242,8 @@ def clob_midprice_cached(token_id):
         _cache[token_id] = p
     return p
 
-
 # ----------------------------------------------------------------
-# Fetch all markets  (v7: filter to SCAN_WINDOW_HOURS)
+# Fetch all markets  (v8: filter to SCAN_WINDOW_HOURS)
 # ----------------------------------------------------------------
 def fetch_all_markets():
     markets = []
@@ -210,7 +283,6 @@ def fetch_all_markets():
     log.info("after " + str(SCAN_WINDOW_HOURS) + "h filter: " + str(len(filtered)) + " markets remain (from " + str(total_raw) + " total)")
     return filtered
 
-
 # ----------------------------------------------------------------
 # Price parsing & helpers
 # ----------------------------------------------------------------
@@ -229,21 +301,18 @@ def parse_prices(market):
         prices = [float(t.get("price", 0)) for t in tokens if t.get("price") is not None]
     return [p for p in prices if 0 < p < 1]
 
-
 def get_url(market):
     slug = market.get("slug", "")
     if slug:
         return "https://polymarket.com/market/" + slug
     return "N/A"
 
-
 def get_urgency(hours_left):
     if hours_left < 6:
-        return "URGENT", "🔴 URGENT"
+        return "URGENT", "\U0001f534 URGENT"
     if hours_left < 72:
-        return "WATCH", "🟡 WATCH"
-    return "EARLY", "🟢 EARLY"
-
+        return "WATCH", "\U0001f7e1 WATCH"
+    return "EARLY", "\U0001f7e2 EARLY"
 
 def hours_until_expiry(market):
     end_date = market.get("endDate") or market.get("end_date_iso")
@@ -259,14 +328,12 @@ def hours_until_expiry(market):
     except Exception:
         return None
 
-
 def tokenize(question):
     words = re.findall(r"[a-zA-Z0-9]+", question.lower())
     stop = {"will","the","a","an","in","of","to","at","is","be","for","on","by","or",
             "and","not","no","vs","who","what","when","does","would","have","has",
             "did","this","that","their","2025","2026","2027","2028"}
     return set(w for w in words if w not in stop and len(w) > 2)
-
 
 def extract_subjects(question):
     words = question.split()
@@ -281,7 +348,6 @@ def extract_subjects(question):
             caps.add(c)
     return caps
 
-
 def has_exclusive_event(q1, q2):
     q1l = q1.lower()
     q2l = q2.lower()
@@ -289,7 +355,6 @@ def has_exclusive_event(q1, q2):
         if event in q1l and event in q2l:
             return True
     return False
-
 
 def is_mutually_exclusive(q1, q2):
     if not has_exclusive_event(q1, q2):
@@ -303,11 +368,9 @@ def is_mutually_exclusive(q1, q2):
         return True
     return False
 
-
 def has_numeric_threshold(q):
     pattern = r'\$\d+[\.,]?\d*\s*[MBKmb]|\d+\s*(?:million|billion|thousand)'
     return bool(re.search(pattern, q, re.IGNORECASE))
-
 
 def is_push_worthy(opp):
     urgency = opp.get("urgency", "EARLY")
@@ -317,7 +380,6 @@ def is_push_worthy(opp):
     if urgency == "WATCH" and edge >= WATCH_PUSH_MIN:
         return True
     return False
-
 
 # ----------------------------------------------------------------
 # Dynamic threshold computation
@@ -331,14 +393,12 @@ def compute_stats(values):
     std = math.sqrt(variance)
     return mean, std
 
-
 def analyze_markets(markets):
     bundle_sums = []
     multi_sums  = []
     expiry_gaps = []
     spreads     = []
     now = datetime.now(timezone.utc)
-
     sampled = 0
     for market in markets:
         if sampled >= SPREAD_SAMPLE:
@@ -352,7 +412,6 @@ def analyze_markets(markets):
                     spreads.append(sp)
                     sampled += 1
                 time.sleep(0.1)
-
     for market in markets:
         prices = parse_prices(market)
         if len(prices) == 2:
@@ -372,28 +431,22 @@ def analyze_markets(markets):
                         expiry_gaps.append((h, min(p, 1 - p)))
             except Exception:
                 pass
-
     b_mean, b_std = compute_stats(bundle_sums)
     bundle_threshold = (b_mean - STD_MULTIPLIER * b_std) if b_mean is not None else 0.97
-
     m_mean, m_std = compute_stats(multi_sums)
     if m_mean is not None:
         multi_lower = m_mean - STD_MULTIPLIER * m_std
         multi_upper = m_mean + STD_MULTIPLIER * m_std
     else:
         multi_lower, multi_upper = 0.97, 1.03
-
     if expiry_gaps:
         devs = [d for (h, d) in expiry_gaps]
         dev_mean, dev_std = compute_stats(devs)
         expiry_threshold = (dev_mean + STD_MULTIPLIER * dev_std) if dev_mean is not None else 0.15
     else:
         expiry_threshold = 0.15
-        dev_mean, dev_std = 0.15, 0.0
-
     spread_mean, spread_std = compute_stats(spreads)
     spread_threshold = (spread_mean + STD_MULTIPLIER * spread_std) if spread_mean is not None else 0.05
-
     log.info("=== Dynamic Thresholds ===")
     if b_mean is not None:
         log.info("Bundle     -> mean=" + str(round(b_mean,4)) + " std=" + str(round(b_std,4)) + " lower=" + str(round(bundle_threshold,4)))
@@ -403,9 +456,7 @@ def analyze_markets(markets):
     if spread_mean is not None:
         log.info("Spread     -> mean=" + str(round(spread_mean,4)) + " threshold=" + str(round(spread_threshold,4)))
     log.info("=========================")
-
     return bundle_threshold, multi_lower, multi_upper, expiry_threshold, spread_threshold
-
 
 # ----------------------------------------------------------------
 # ARB detectors
@@ -432,7 +483,6 @@ def detect_bundle(market, threshold):
         }
     return None
 
-
 def detect_multi_under(market, threshold):
     prices = parse_prices(market)
     if len(prices) < 3:
@@ -454,7 +504,6 @@ def detect_multi_under(market, threshold):
             "action": "BUY YES on all outcomes",
         }
     return None
-
 
 def detect_multi_over(market, threshold):
     prices = parse_prices(market)
@@ -478,7 +527,6 @@ def detect_multi_over(market, threshold):
             "action": "SELL YES on all outcomes",
         }
     return None
-
 
 def detect_near_expiry(market, dev_threshold):
     h = hours_until_expiry(market)
@@ -505,7 +553,6 @@ def detect_near_expiry(market, dev_threshold):
             "action": "Check price direction vs reality",
         }
     return None
-
 
 def detect_clob_confirmed(market, threshold):
     tokens = market.get("tokens", [])
@@ -538,7 +585,6 @@ def detect_clob_confirmed(market, threshold):
                 "action": "BUY YES + BUY NO immediately",
             }
     return None
-
 
 # ----------------------------------------------------------------
 # Cross-market detector
@@ -616,7 +662,6 @@ def detect_cross_market(markets, b_lower, b_upper):
     log.info("Cross-market: skipped " + str(skip_mutex) + " mutex + " + str(skip_lowsum) + " low-sum + " + str(skip_nested) + " nested-threshold pairs")
     return opps
 
-
 def detect_parent_child(markets):
     opps = []
     BROAD  = {"reach","advance","qualify","enter","make","final","semifinal","playoff","round"}
@@ -673,7 +718,6 @@ def detect_parent_child(markets):
                         "action": "BUY parent YES + SELL child YES",
                     })
     return opps
-
 
 # ----------------------------------------------------------------
 # Time-series detector
@@ -748,7 +792,6 @@ def detect_time_series(markets):
     log.info("Time-series: skipped " + str(skip_no_subject) + " pairs with no common subject")
     return opps
 
-
 def detect_price_anchor(markets):
     opps = []
     for market in markets:
@@ -760,7 +803,7 @@ def detect_price_anchor(markets):
             if 0.2 <= p <= 0.8:
                 edge = round(min(p, 1 - p), 4)
                 opps.append({
-                    "type": "🔴 URGENT Price Anchor ARB",
+                    "type": "\U0001f534 URGENT Price Anchor ARB",
                     "market": market.get("question", market.get("slug", "N/A")),
                     "url": get_url(market),
                     "prices": prices,
@@ -774,7 +817,6 @@ def detect_price_anchor(markets):
                 })
                 break
     return opps
-
 
 def detect_liquidity_spread(markets, spread_threshold):
     opps = []
@@ -811,7 +853,6 @@ def detect_liquidity_spread(markets, spread_threshold):
         time.sleep(0.1)
     return opps
 
-
 def detect_info_arbitrage(markets):
     opps = []
     for market in markets:
@@ -841,16 +882,304 @@ def detect_info_arbitrage(markets):
                 break
     return opps
 
+# ----------------------------------------------------------------
+# Weather predictor (v8: Open-Meteo + NOAA key optional)
+# ----------------------------------------------------------------
+def get_open_meteo_prob(lat, lon, condition, target_value):
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "temperature_2m,precipitation_probability,windspeed_10m",
+                "forecast_days": 3,
+                "timezone": "UTC",
+            },
+            timeout=10
+        )
+        data = r.json()
+        hourly = data.get("hourly", {})
+        if condition == "temp_above":
+            vals = hourly.get("temperature_2m", [])
+            if not vals:
+                return None
+            count = sum(1 for v in vals if v is not None and v > target_value)
+            return round(count / len(vals), 4)
+        if condition == "temp_below":
+            vals = hourly.get("temperature_2m", [])
+            if not vals:
+                return None
+            count = sum(1 for v in vals if v is not None and v < target_value)
+            return round(count / len(vals), 4)
+        if condition == "precip_above":
+            vals = hourly.get("precipitation_probability", [])
+            if not vals:
+                return None
+            count = sum(1 for v in vals if v is not None and v > target_value)
+            return round(count / len(vals), 4)
+        if condition == "wind_above":
+            vals = hourly.get("windspeed_10m", [])
+            if not vals:
+                return None
+            count = sum(1 for v in vals if v is not None and v > target_value)
+            return round(count / len(vals), 4)
+        return None
+    except Exception as ex:
+        log.warning("Open-Meteo error: " + str(ex))
+        return None
+
+def parse_weather_question(question):
+    q_low = question.lower()
+    has_weather = any(kw in q_low for kw in WEATHER_KEYWORDS)
+    if not has_weather:
+        return None
+    city = None
+    for pattern in [r"in ([a-z ]+?)(?:\?|$| by| above| below| exceed)",
+                     r"for ([a-z ]+?)(?:\?|$| by| above| below| exceed)",
+                     r"at ([a-z ]+?)(?:\?|$| by| above| below| exceed),"]:
+        m = re.search(pattern, q_low)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate in CITY_COORDS:
+                city = candidate
+                break
+    if city is None:
+        for c in CITY_COORDS:
+            if c in q_low:
+                city = c
+                break
+    if city is None:
+        return None
+    num_match = re.search(r"(-?\d+\.?\d*)", question)
+    threshold = float(num_match.group(1)) if num_match else 0.0
+    condition = "temp_above"
+    if any(w in q_low for w in ["rain","precipitation","flood","snow","blizzard"]):
+        condition = "precip_above"
+    elif any(w in q_low for w in ["wind","storm","hurricane","typhoon","cyclone","tornado"]):
+        condition = "wind_above"
+    elif any(w in q_low for w in ["below","cold","freeze","freezing"]):
+        condition = "temp_below"
+    elif any(w in q_low for w in ["above","exceed","hot","warm","high"]):
+        condition = "temp_above"
+    return {"city": city, "condition": condition, "threshold": threshold}
+
+def detect_weather_markets(markets):
+    opps = []
+    scanned = 0
+    for market in markets:
+        q = market.get("question", "")
+        parsed = parse_weather_question(q)
+        if parsed is None:
+            continue
+        scanned += 1
+        city = parsed["city"]
+        coords = CITY_COORDS.get(city)
+        if coords is None:
+            continue
+        lat, lon = coords
+        model_prob = get_open_meteo_prob(lat, lon, parsed["condition"], parsed["threshold"])
+        if model_prob is None:
+            continue
+        prices = parse_prices(market)
+        if len(prices) != 2:
+            continue
+        market_price = prices[0]
+        edge = round(abs(model_prob - market_price), 4)
+        if edge < WEATHER_EDGE_MIN:
+            continue
+        h = hours_until_expiry(market)
+        urgency_key, urgency_label = get_urgency(h) if h else ("WATCH", "\U0001f7e1 WATCH")
+        direction = "BUY YES" if model_prob > market_price else "BUY NO"
+        confidence = "HIGH" if edge > 0.20 else "MEDIUM"
+        opps.append({
+            "type": urgency_label + " Weather Prediction",
+            "market": q,
+            "url": get_url(market),
+            "prices": prices,
+            "model_prob": model_prob,
+            "market_price": market_price,
+            "edge": edge,
+            "edge_pct": "{:.2f}%".format(edge * 100),
+            "liquidity": market.get("liquidity", "N/A"),
+            "threshold_used": WEATHER_EDGE_MIN,
+            "urgency": urgency_key,
+            "action": direction,
+            "confidence": confidence,
+            "city": city,
+            "condition": parsed["condition"],
+            "hours_left": round(h, 2) if h else None,
+        })
+    log.info("Weather: found " + str(len(opps)) + " opportunities from " + str(scanned) + " weather markets scanned")
+    return opps
+
+# ----------------------------------------------------------------
+# Sports predictor (v8: The Odds API)
+# ----------------------------------------------------------------
+_odds_cache = {}
+
+def get_odds_for_sport(sport_key):
+    if sport_key in _odds_cache:
+        return _odds_cache[sport_key]
+    if not ODDS_API_KEY:
+        return []
+    try:
+        r = SESSION.get(
+            ODDS_API_BASE + "/sports/" + sport_key + "/odds/",
+            params={
+                "apiKey": ODDS_API_KEY,
+                "regions": "us,uk",
+                "markets": "h2h",
+                "oddsFormat": "decimal",
+                "dateFormat": "iso",
+            },
+            timeout=10
+        )
+        remaining = r.headers.get("x-requests-remaining", "?")
+        log.info("Odds API [" + sport_key + "] remaining requests: " + str(remaining))
+        if r.status_code == 200:
+            games = r.json()
+            _odds_cache[sport_key] = games
+            return games
+        else:
+            log.warning("Odds API error " + sport_key + ": " + r.text[:100])
+            return []
+    except Exception as ex:
+        log.warning("Odds API exception: " + str(ex))
+        return []
+
+def decimal_to_prob(decimal_odds):
+    if decimal_odds and decimal_odds > 1.0:
+        return round(1.0 / decimal_odds, 4)
+    return 0.0
+
+def normalize_team_name(name):
+    return re.sub(r"[^a-z0-9 ]", "", name.lower()).strip()
+
+def find_team_in_game(game, team_hint):
+    hint = normalize_team_name(team_hint)
+    home = normalize_team_name(game.get("home_team", ""))
+    away = normalize_team_name(game.get("away_team", ""))
+    if hint in home or home in hint:
+        return game.get("home_team")
+    if hint in away or away in hint:
+        return game.get("away_team")
+    hint_words = set(hint.split())
+    home_words = set(home.split())
+    away_words = set(away.split())
+    if len(hint_words & home_words) >= 1:
+        return game.get("home_team")
+    if len(hint_words & away_words) >= 1:
+        return game.get("away_team")
+    return None
+
+def get_best_market_prob(game, team_name):
+    team_norm = normalize_team_name(team_name)
+    probs = []
+    for bm in game.get("bookmakers", []):
+        for market in bm.get("markets", []):
+            if market.get("key") != "h2h":
+                continue
+            for outcome in market.get("outcomes", []):
+                if normalize_team_name(outcome.get("name", "")) == team_norm:
+                    p = decimal_to_prob(outcome.get("price", 0))
+                    if p > 0:
+                        probs.append(p)
+    if not probs:
+        return None
+    return round(sum(probs) / len(probs), 4)
+
+def parse_sports_question(question):
+    q_low = question.lower()
+    sport_key = None
+    for kw in ODDS_SPORT_MAP:
+        if kw in q_low:
+            sport_key = ODDS_SPORT_MAP[kw]
+            break
+    if sport_key is None:
+        for kw in SPORTS_KEYWORDS:
+            if kw in q_low:
+                sport_key = "americanfootball_nfl"
+                break
+    if sport_key is None:
+        return None, []
+    words = question.split()
+    teams = []
+    for w in words:
+        cleaned = re.sub(r"[^a-zA-Z]", "", w)
+        if len(cleaned) > 2 and cleaned[0].isupper() and cleaned.lower() not in SUBJECT_STOPWORDS:
+            teams.append(cleaned)
+    return sport_key, teams
+
+def detect_sports_markets(markets):
+    if not ODDS_API_KEY:
+        log.warning("Sports: ODDS_API_KEY not set, skipping")
+        return []
+    opps = []
+    scanned = 0
+    for market in markets:
+        q = market.get("question", "")
+        sport_key, teams = parse_sports_question(q)
+        if sport_key is None:
+            continue
+        scanned += 1
+        games = get_odds_for_sport(sport_key)
+        if not games:
+            continue
+        prices = parse_prices(market)
+        if len(prices) != 2:
+            continue
+        market_price = prices[0]
+        best_edge = 0
+        best_opp = None
+        for game in games:
+            for team_hint in teams:
+                matched = find_team_in_game(game, team_hint)
+                if matched is None:
+                    continue
+                implied_prob = get_best_market_prob(game, matched)
+                if implied_prob is None:
+                    continue
+                edge = round(abs(implied_prob - market_price), 4)
+                if edge < SPORTS_EDGE_MIN:
+                    continue
+                if edge > best_edge:
+                    best_edge = edge
+                    h = hours_until_expiry(market)
+                    urgency_key, urgency_label = get_urgency(h) if h else ("WATCH", "\U0001f7e1 WATCH")
+                    direction = "BUY YES" if implied_prob > market_price else "BUY NO"
+                    confidence = "HIGH" if edge > 0.10 else "MEDIUM"
+                    home = game.get("home_team", "")
+                    away = game.get("away_team", "")
+                    best_opp = {
+                        "type": urgency_label + " Sports Prediction",
+                        "market": q,
+                        "url": get_url(market),
+                        "prices": prices,
+                        "bookmaker_prob": implied_prob,
+                        "market_price": market_price,
+                        "edge": best_edge,
+                        "edge_pct": "{:.2f}%".format(best_edge * 100),
+                        "liquidity": market.get("liquidity", "N/A"),
+                        "threshold_used": SPORTS_EDGE_MIN,
+                        "urgency": urgency_key,
+                        "action": direction,
+                        "confidence": confidence,
+                        "matchup": home + " vs " + away,
+                        "hours_left": round(h, 2) if h else None,
+                    }
+        if best_opp:
+            opps.append(best_opp)
+    log.info("Sports: found " + str(len(opps)) + " opportunities from " + str(scanned) + " sports markets scanned")
+    return opps
 
 # ----------------------------------------------------------------
 # Output formatting
 # ----------------------------------------------------------------
 URGENCY_ORDER = {"URGENT": 0, "WATCH": 1, "EARLY": 2}
 
-
 def sort_opps(opps):
     return sorted(opps, key=lambda o: (URGENCY_ORDER.get(o.get("urgency","EARLY"),2), -o.get("edge",0)))
-
 
 def fmt_opp(opp, idx):
     price_list = opp.get("prices") or opp.get("prices_clob", [])
@@ -864,6 +1193,14 @@ def fmt_opp(opp, idx):
         out += "URL       : " + opp.get("url","N/A") + "\n"
     out += "Liquidity : $" + str(opp.get("liquidity","N/A")) + "\n"
     out += "Action    : " + opp.get("action","N/A") + "\n"
+    if "model_prob" in opp:
+        out += "Model Prob: " + str(opp["model_prob"]) + "  Market: " + str(opp["market_price"]) + "\n"
+    if "bookmaker_prob" in opp:
+        out += "Bookmaker : " + str(opp["bookmaker_prob"]) + "  Market: " + str(opp["market_price"]) + "\n"
+    if "matchup" in opp:
+        out += "Matchup   : " + opp["matchup"] + "\n"
+    if "confidence" in opp:
+        out += "Confidence: " + opp["confidence"] + "\n"
     if "overround" in opp:
         out += "Sum       : " + str(opp["sum"]) + "  Overround: " + opp.get("overround_pct","N/A") + "\n"
     elif "spread" in opp:
@@ -871,24 +1208,23 @@ def fmt_opp(opp, idx):
     else:
         out += "Edge      : " + opp.get("edge_pct","N/A") + "\n"
     out += "Prices    : " + str(price_list) + "\n"
-    if "hours_left" in opp:
+    if "hours_left" in opp and opp["hours_left"] is not None:
         out += "Expires in: " + str(opp["hours_left"]) + "h\n"
     if "common_keywords" in opp:
         out += "Keywords  : " + str(opp["common_keywords"]) + "\n"
     return out
 
-
 # ----------------------------------------------------------------
-# build_tg_msg  (v7.1: push up to 10 opps, concise format)
+# build_tg_msg  (v8: weather/sports extra line)
 # ----------------------------------------------------------------
 def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
-    msg = "<b>Polymarket ARB Scanner v7 - " + str(len(push_opps)) + " alerts</b>\n"
+    msg = "<b>Polymarket ARB Scanner v8 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
     msg += "Markets scanned (&lt;=72h): " + str(total_markets) + "\n"
-    msg += "🔴 Urgent: " + str(urgent_n) + "  🟡 Watch(≥2%): " + str(watch_n) + "\n"
+    msg += "\U0001f534 Urgent: " + str(urgent_n) + "  \U0001f7e1 Watch(\u22652%): " + str(watch_n) + "\n"
     msg += "Filtered out: " + str(filtered_n) + " (EARLY / edge&lt;2% / mutex / nested)\n"
     msg += "Thresholds: " + thresholds + "\n\n"
     for idx, opp in enumerate(push_opps[:10], 1):
@@ -897,14 +1233,20 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
         msg += "<b>#" + str(idx) + " " + opp["type"] + "</b>\n"
         msg += opp.get("market","N/A")[:60] + "\n"
         msg += "Action: " + opp.get("action","N/A") + "\n"
-        if "overround" in opp:
+        if "model_prob" in opp:
+            msg += "Model: " + str(opp["model_prob"]) + " vs Market: " + str(opp["market_price"]) + "\n"
+        elif "bookmaker_prob" in opp:
+            msg += "Bookmaker: " + str(opp["bookmaker_prob"]) + " vs Market: " + str(opp["market_price"]) + "\n"
+        elif "overround" in opp:
             msg += "Overround: " + opp["overround_pct"] + "  Sum: " + str(opp["sum"]) + "\n"
         elif "spread" in opp:
             msg += "Spread: " + str(opp["spread"]) + "  Mid: " + str(opp.get("midpoint","")) + "\n"
         else:
             msg += "Edge: " + opp.get("edge_pct","N/A") + "\n"
+        if "confidence" in opp:
+            msg += "Confidence: " + opp["confidence"] + "\n"
         msg += "Prices: " + str(opp.get("prices") or opp.get("prices_clob",[])) + "\n"
-        if "hours_left" in opp:
+        if opp.get("hours_left") is not None:
             msg += "Expires: " + str(opp["hours_left"]) + "h\n"
         msg += '<a href="' + url + '">URL1</a>'
         if url2:
@@ -914,14 +1256,15 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
         msg += "<i>... and " + str(len(push_opps) - 10) + " more in arb_report.json</i>\n"
     return msg
 
-
 # ----------------------------------------------------------------
 # Main scan
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
-    log.info("Polymarket ARB Scanner v7.1 - msg-split + 10-alert push")
+    log.info("Polymarket ARB Scanner v8 - weather + sports modules")
     log.info("MIN_EDGE=" + str(MIN_EDGE) + " WATCH_PUSH_MIN=" + str(WATCH_PUSH_MIN) + " SCAN_WINDOW=" + str(SCAN_WINDOW_HOURS) + "h")
+    log.info("NOAA_KEY=" + ("SET" if NOAA_API_KEY else "NOT SET") + "  ODDS_KEY=" + ("SET" if ODDS_API_KEY else "NOT SET"))
+    log.info("WEATHER_EDGE=" + str(WEATHER_EDGE_MIN) + "  SPORTS_EDGE=" + str(SPORTS_EDGE_MIN))
     log.info("Time: " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     log.info("=" * 60)
 
@@ -968,6 +1311,11 @@ def scan():
     opps += detect_liquidity_spread(markets, sp_thr)
     opps += detect_info_arbitrage(markets)
 
+    log.info("Running weather predictor...")
+    opps += detect_weather_markets(markets)
+    log.info("Running sports predictor...")
+    opps += detect_sports_markets(markets)
+
     seen = set()
     unique_opps = []
     for o in opps:
@@ -988,11 +1336,11 @@ def scan():
 
     log.info("=" * 60)
     log.info("DONE - " + str(len(opps)) + " total opportunities")
-    log.info("  🔴 URGENT   : " + str(urgent_n) + "  (all pushed)")
-    log.info("  🟡 WATCH    : " + str(watch_n) + "  (pushed if edge>=2%)")
-    log.info("  🟢 EARLY    : " + str(early_n) + "  (file only)")
-    log.info("  📤 Pushed   : " + str(pushed_n))
-    log.info("  📁 Filtered : " + str(filtered_n))
+    log.info("  \U0001f534 URGENT   : " + str(urgent_n) + "  (all pushed)")
+    log.info("  \U0001f7e1 WATCH    : " + str(watch_n) + "  (pushed if edge>=2%)")
+    log.info("  \U0001f7e2 EARLY    : " + str(early_n) + "  (file only)")
+    log.info("  \U0001f4e4 Pushed   : " + str(pushed_n))
+    log.info("  \U0001f4c1 Filtered : " + str(filtered_n))
     log.info("=" * 60)
 
     thr_str = "B=" + str(round(b_thr,4)) + " ML=" + str(round(m_low,4)) + " MH=" + str(round(m_high,4)) + " E=" + str(round(e_thr,4))
@@ -1004,11 +1352,11 @@ def scan():
     if not push_opps:
         log.info("Nothing push-worthy this round")
         send_telegram(
-            "<b>Polymarket ARB Scanner v7.1</b>\n"
+            "<b>Polymarket ARB Scanner v8</b>\n"
             + "Time: " + now_str + "\n"
             + "Markets scanned (&lt;=72h): " + str(len(markets)) + "\n"
             + "Thresholds: " + thr_str + "\n"
-            + "🔴 Urgent: 0  🟡 Watch(≥2%): 0\n"
+            + "\U0001f534 Urgent: 0  \U0001f7e1 Watch(\u22652%): 0\n"
             + "Filtered (EARLY/low-edge/mutex/nested): " + str(filtered_n) + "\n"
             + "Result: No high-priority opportunities"
         )
