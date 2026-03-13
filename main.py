@@ -1367,6 +1367,8 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
+    directional_n = sum(1 for o in push_opps if "Directional" in o.get("type", ""))
+    whale_n       = sum(1 for o in push_opps if "Whale"       in o.get("type", ""))
     msg = "<b>Polymarket ARB Scanner v9.0 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
     msg += "Markets scanned (&lt;=72h): " + str(total_markets) + "\n"
