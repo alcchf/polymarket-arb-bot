@@ -77,11 +77,6 @@ WEATHER_KEYWORDS = [
     "landfall","tropical","drought","heatwave","heat wave","exceed",
     "reaches","high temp","low temp","record high","record low",
     "snowfall","rainfall","mph","category","wildfire","heat",
-# extended keywords (v9.1)
-"high of","low of","exceed","degrees","inches","accumulation",
-"deficit","surplus","warmer","cooler","wetter","drier",
-"hottest","coldest","wettest","driest","record","average",
-"normal","anomaly","departure","above normal","below normal",
 ]
 
 SPORTS_KEYWORDS = [
@@ -166,43 +161,6 @@ CITY_COORDS = {
     "midwest":       (41.88, -87.63),
     "gulf coast":    (29.76, -95.37),
     "northeast":     (42.36, -71.06),
-# extended cities (v9.1)
-"washington":    (38.89,  -77.03),
-"philadelphia":  (39.95,  -75.16),
-"minneapolis":   (44.98,  -93.27),
-"detroit":       (42.33,  -83.05),
-"portland":      (45.52, -122.68),
-"nashville":     (36.17,  -86.78),
-"memphis":       (35.15,  -90.05),
-"louisville":    (38.25,  -85.76),
-"oklahoma city": (35.47,  -97.52),
-"salt lake city":(40.76, -111.89),
-"raleigh":       (35.78,  -78.64),
-"richmond":      (37.54,  -77.43),
-"buffalo":       (42.89,  -78.87),
-"pittsburgh":    (40.44,  -79.99),
-"cleveland":     (41.50,  -81.69),
-"cincinnati":    (39.10,  -84.51),
-"kansas city":   (39.10,  -94.58),
-"sacramento":    (38.58, -121.49),
-"san diego":     (32.72, -117.16),
-"san jose":      (37.34, -121.89),
-"austin":        (30.27,  -97.74),
-"san antonio":   (29.42,  -98.49),
-"charlotte":     (35.23,  -80.84),
-"indianapolis":  (39.77,  -86.16),
-"columbus":      (39.96,  -82.99),
-"jacksonville":  (30.33,  -81.66),
-"fort worth":    (32.75,  -97.33),
-"el paso":       (31.76, -106.49),
-"uk":            (51.51,   -0.13),
-"europe":        (50.00,   10.00),
-"northeast us":  (42.36,  -71.06),
-"midwest us":    (41.88,  -87.63),
-"southeast us":  (33.75,  -84.39),
-"southwest us":  (33.45, -112.07),
-"west coast":    (37.77, -122.42),
-"east coast":    (40.71,  -74.01),
 }
 
 # ----------------------------------------------------------------
@@ -1189,13 +1147,15 @@ def detect_weather_markets(markets):
             "condition": parsed["condition"],
             "hours_left": round(h, 2) if h else None,
         })
-    log.info("Weather: found " + str(len(opps)) + " opportunities from " + str(scanned) + " weather markets scanned")
+    log.info("Weather: checked " + str(len(markets)) + " markets, " + str(scanned) + " keyword-matched, " + str(len(opps)) + " opportunities found")
     return opps
 
 # ----------------------------------------------------------------
 # Sports predictor (v9.0: The Odds API)
 # ----------------------------------------------------------------
 _odds_cache = {}
+_odds_last_call = {}              # sport_key -> last call unix timestamp
+ODDS_RATE_LIMIT_DELAY = 1.2       # min seconds between calls to same endpoint
 
 def get_odds_for_sport(sport_key):
     if sport_key in _odds_cache:
@@ -1203,6 +1163,12 @@ def get_odds_for_sport(sport_key):
     if not ODDS_API_KEY:
         return []
     try:
+        # ── rate-limit guard (v9.0) ─────────────────────────────
+        _now  = time.time()
+        _wait = ODDS_RATE_LIMIT_DELAY - (_now - _odds_last_call.get(sport_key, 0))
+        if _wait > 0:
+            time.sleep(_wait)
+        _odds_last_call[sport_key] = time.time()
         r = SESSION.get(
             ODDS_API_BASE + "/sports/" + sport_key + "/odds/",
             params={
@@ -1268,83 +1234,6 @@ def get_best_market_prob(game, team_name):
         return None
     return round(sum(probs) / len(probs), 4)
 
-
-TEAM_SPORT_MAP = {
-    # NBA
-    "knicks": "basketball_nba", "lakers": "basketball_nba", "celtics": "basketball_nba",
-    "warriors": "basketball_nba", "heat": "basketball_nba", "bulls": "basketball_nba",
-    "nets": "basketball_nba", "clippers": "basketball_nba", "nuggets": "basketball_nba",
-    "suns": "basketball_nba", "bucks": "basketball_nba", "sixers": "basketball_nba",
-    "cavaliers": "basketball_nba", "hawks": "basketball_nba", "pacers": "basketball_nba",
-    "magic": "basketball_nba", "pistons": "basketball_nba", "raptors": "basketball_nba",
-    "hornets": "basketball_nba", "wizards": "basketball_nba", "spurs": "basketball_nba",
-    "mavericks": "basketball_nba", "rockets": "basketball_nba", "grizzlies": "basketball_nba",
-    "pelicans": "basketball_nba", "thunder": "basketball_nba", "jazz": "basketball_nba",
-    "timberwolves": "basketball_nba", "blazers": "basketball_nba", "kings": "basketball_nba",
-    # NFL
-    "patriots": "americanfootball_nfl", "chiefs": "americanfootball_nfl",
-    "eagles": "americanfootball_nfl", "cowboys": "americanfootball_nfl",
-    "rams": "americanfootball_nfl", "49ers": "americanfootball_nfl",
-    "ravens": "americanfootball_nfl", "bills": "americanfootball_nfl",
-    "broncos": "americanfootball_nfl", "steelers": "americanfootball_nfl",
-    "packers": "americanfootball_nfl", "seahawks": "americanfootball_nfl",
-    "saints": "americanfootball_nfl", "buccaneers": "americanfootball_nfl",
-    "chargers": "americanfootball_nfl", "raiders": "americanfootball_nfl",
-    "dolphins": "americanfootball_nfl", "colts": "americanfootball_nfl",
-    "titans": "americanfootball_nfl", "texans": "americanfootball_nfl",
-    "bears": "americanfootball_nfl", "lions": "americanfootball_nfl",
-    "vikings": "americanfootball_nfl", "falcons": "americanfootball_nfl",
-    "cardinals": "americanfootball_nfl", "giants": "americanfootball_nfl",
-    "commanders": "americanfootball_nfl", "jets": "americanfootball_nfl",
-    "browns": "americanfootball_nfl", "bengals": "americanfootball_nfl",
-    # MLB
-    "yankees": "baseball_mlb", "dodgers": "baseball_mlb", "red sox": "baseball_mlb",
-    "cubs": "baseball_mlb", "astros": "baseball_mlb", "mets": "baseball_mlb",
-    "braves": "baseball_mlb", "padres": "baseball_mlb", "phillies": "baseball_mlb",
-    "white sox": "baseball_mlb", "blue jays": "baseball_mlb", "orioles": "baseball_mlb",
-    "guardians": "baseball_mlb", "twins": "baseball_mlb", "royals": "baseball_mlb",
-    "tigers": "baseball_mlb", "rays": "baseball_mlb", "mariners": "baseball_mlb",
-    "athletics": "baseball_mlb", "angels": "baseball_mlb",
-    # NHL
-    "maple leafs": "icehockey_nhl", "bruins": "icehockey_nhl", "rangers": "icehockey_nhl",
-    "lightning": "icehockey_nhl", "avalanche": "icehockey_nhl",
-    "golden knights": "icehockey_nhl", "oilers": "icehockey_nhl",
-    "flames": "icehockey_nhl", "canucks": "icehockey_nhl",
-    "penguins": "icehockey_nhl", "capitals": "icehockey_nhl",
-    "hurricanes": "icehockey_nhl", "panthers": "icehockey_nhl",
-    "wild": "icehockey_nhl", "predators": "icehockey_nhl",
-    "stars": "icehockey_nhl", "blues": "icehockey_nhl",
-    "jets": "icehockey_nhl", "ducks": "icehockey_nhl",
-    "sharks": "icehockey_nhl", "coyotes": "icehockey_nhl",
-    "senators": "icehockey_nhl", "sabres": "icehockey_nhl",
-    # Soccer clubs
-    "real madrid": "soccer_spain_la_liga", "barcelona": "soccer_spain_la_liga",
-    "atletico": "soccer_spain_la_liga", "sevilla": "soccer_spain_la_liga",
-    "villarreal": "soccer_spain_la_liga", "valencia": "soccer_spain_la_liga",
-    "manchester": "soccer_epl", "arsenal": "soccer_epl", "chelsea": "soccer_epl",
-    "liverpool": "soccer_epl", "tottenham": "soccer_epl", "newcastle": "soccer_epl",
-    "aston villa": "soccer_epl", "brighton": "soccer_epl", "west ham": "soccer_epl",
-    "everton": "soccer_epl", "fulham": "soccer_epl", "brentford": "soccer_epl",
-    "leicester": "soccer_epl", "wolves": "soccer_epl", "nottm forest": "soccer_epl",
-    "crystal palace": "soccer_epl", "ipswich": "soccer_epl", "southampton": "soccer_epl",
-    "bayern": "soccer_germany_bundesliga", "dortmund": "soccer_germany_bundesliga",
-    "leverkusen": "soccer_germany_bundesliga", "frankfurt": "soccer_germany_bundesliga",
-    "juventus": "soccer_italy_serie_a", "milan": "soccer_italy_serie_a",
-    "inter": "soccer_italy_serie_a", "napoli": "soccer_italy_serie_a",
-    "roma": "soccer_italy_serie_a", "lazio": "soccer_italy_serie_a",
-    "atalanta": "soccer_italy_serie_a",
-    "psg": "soccer_france_ligue_one", "marseille": "soccer_france_ligue_one",
-    "monaco": "soccer_france_ligue_one", "lyon": "soccer_france_ligue_one",
-    "lille": "soccer_france_ligue_one",
-    # CL / international
-    "ajax": "soccer_uefa_champs_league", "porto": "soccer_uefa_champs_league",
-    "benfica": "soccer_uefa_champs_league", "sporting": "soccer_uefa_champs_league",
-    "celtic": "soccer_uefa_champs_league", "rangers fc": "soccer_uefa_champs_league",
-    "psv": "soccer_uefa_champs_league", "feyenoord": "soccer_uefa_champs_league",
-    "dinamo": "soccer_uefa_champs_league", "shakhtar": "soccer_uefa_champs_league",
-    "red bull": "soccer_uefa_champs_league",
-}
-
 def parse_sports_question(question):
     q_low = question.lower()
     # Sort keys longest-first to get most-specific match first
@@ -1359,17 +1248,14 @@ def parse_sports_question(question):
             if kw in q_low:
                 sport_keys.append("americanfootball_nfl")
                 break
-    # Pass 2: team name matching via TEAM_SPORT_MAP
-    for team_kw, sk in TEAM_SPORT_MAP.items():
-        if team_kw in q_low:
-            if sk not in sport_keys:
-                sport_keys.append(sk)
-    # Pass 3: "vs" / "v " pattern → try all major sport keys
-    if not sport_keys and (
-        "vs." in q_low or " vs " in q_low or " v " in q_low
-        or " at " in q_low
-    ):
-        sport_keys = list(dict.fromkeys(ODDS_SPORT_MAP.values()))
+    # Pass 2: team name matching via TEAM_SPORT_MAP (if defined)
+    for _tkw, _sk in getattr(globals().get('TEAM_SPORT_MAP', {}), 'items', dict().items)():
+        if _tkw in q_low and _sk not in sport_keys:
+            sport_keys.append(_sk)
+    # Pass 3: bare 'vs' → top-5 keys (rate-limit safe)
+    if not sport_keys and ("vs." in q_low or " vs " in q_low or " v " in q_low):
+        sport_keys = ["basketball_nba", "americanfootball_nfl",
+                      "soccer_epl", "soccer_uefa_champs_league", "baseball_mlb"]
     if not sport_keys:
         return None, []
     words = question.split()
@@ -1444,7 +1330,7 @@ def detect_sports_markets(markets):
                     }
         if best_opp:
             opps.append(best_opp)
-    log.info("Sports: found " + str(len(opps)) + " opportunities from " + str(scanned) + " sports markets scanned")
+    log.info("Sports: checked " + str(len(markets)) + " markets, " + str(scanned) + " keyword-matched, " + str(len(opps)) + " opportunities found")
     return opps
 
 # ----------------------------------------------------------------
@@ -1631,8 +1517,11 @@ def scan():
     thr_str = "B=" + str(round(b_thr,4)) + " ML=" + str(round(m_low,4)) + " MH=" + str(round(m_high,4)) + " E=" + str(round(e_thr,4))
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    for idx, opp in enumerate(opps, 1):
-        print(fmt_opp(opp, idx))
+    try:
+        for idx, opp in enumerate(opps, 1):
+            print(fmt_opp(opp, idx))
+    except Exception as _print_ex:
+        log.warning("fmt_opp print error: " + str(_print_ex))
 
     if not push_opps:
         log.info("Nothing push-worthy this round")
