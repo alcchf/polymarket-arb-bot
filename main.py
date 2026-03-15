@@ -1342,47 +1342,52 @@ def sort_opps(opps):
     return sorted(opps, key=lambda o: (URGENCY_ORDER.get(o.get("urgency","EARLY"),2), -o.get("edge",0)))
 
 def fmt_opp(opp, idx):
-    price_list = opp.get("prices") or opp.get("prices_clob", [])
-    out = "=" * 60 + "\n"
-    out += "#{:02d} {}\n".format(idx, opp["type"])
-    out += "Market    : " + opp["market"][:80] + "\n"
-    if opp.get("url2"):
-        out += "URL 1     : " + opp.get("url","N/A") + "\n"
-        out += "URL 2     : " + opp.get("url2","N/A") + "\n"
-    else:
-        out += "URL       : " + opp.get("url","N/A") + "\n"
-    out += "Liquidity : $" + str(opp.get("liquidity","N/A")) + "\n"
-    out += "Action    : " + opp.get("action","N/A") + "\n"
-    if "model_prob" in opp:
-        out += "Model Prob: " + str(opp["model_prob"]) + "  Market: " + str(opp["market_price"]) + "\n"
-    if "bookmaker_prob" in opp:
-        out += "Bookmaker : " + str(opp["bookmaker_prob"]) + "  Market: " + str(opp["market_price"]) + "\n"
-    if "matchup" in opp:
-        out += "Matchup   : " + opp["matchup"] + "\n"
-    if "confidence" in opp:
-        out += "Confidence: " + opp["confidence"] + "\n"
-    if "net_flow_usd" in opp:
-        out += "Net Flow  : $" + str(opp["net_flow_usd"]) + "  (" + opp.get("whale_direction", "N/A") + ")\n"
-        out += "Buy/Sell  : $" + str(opp.get("buy_usd", 0)) + " / $" + str(opp.get("sell_usd", 0)) + "\n"
-    if "yes_price" in opp:
-        out += "YES Price : " + str(opp["yes_price"]) + "\n"
-    if "overround" in opp:
-        out += "Sum       : " + str(opp["sum"]) + "  Overround: " + opp.get("overround_pct","N/A") + "\n"
-    elif "spread" in opp:
-        out += "Spread    : " + str(opp["spread"]) + "  Midpoint: " + str(opp.get("midpoint","N/A")) + "\n"
-    else:
-        out += "Edge      : " + opp.get("edge_pct","N/A") + "\n"
-    out += "Prices    : " + str(price_list) + "\n"
-    if "hours_left" in opp and opp["hours_left"] is not None:
-        out += "Expires in: " + str(opp["hours_left"]) + "h\n"
-    if "common_keywords" in opp:
-        out += "Keywords  : " + str(opp["common_keywords"]) + "\n"
-    return out
+    try:
+        price_list = opp.get("prices") or opp.get("prices_clob", [])
+        out = "=" * 60 + "\n"
+        out += "#{:02d} {}\n".format(idx, opp["type"])
+        out += "Market    : " + opp["market"][:80] + "\n"
+        if opp.get("url2"):
+            out += "URL 1     : " + opp.get("url","N/A") + "\n"
+            out += "URL 2     : " + opp.get("url2","N/A") + "\n"
+        else:
+            out += "URL       : " + opp.get("url","N/A") + "\n"
+        out += "Liquidity : $" + str(opp.get("liquidity","N/A")) + "\n"
+        out += "Action    : " + opp.get("action","N/A") + "\n"
+        if "model_prob" in opp:
+            out += "Model Prob: " + str(opp["model_prob"]) + "  Market: " + str(opp["market_price"]) + "\n"
+        if "bookmaker_prob" in opp:
+            out += "Bookmaker : " + str(opp["bookmaker_prob"]) + "  Market: " + str(opp["market_price"]) + "\n"
+        if "matchup" in opp:
+            out += "Matchup   : " + opp["matchup"] + "\n"
+        if "confidence" in opp:
+            out += "Confidence: " + opp["confidence"] + "\n"
+        if "net_flow_usd" in opp:
+            out += "Net Flow  : $" + str(opp["net_flow_usd"]) + "  (" + opp.get("whale_direction", "N/A") + ")\n"
+            out += "Buy/Sell  : $" + str(opp.get("buy_usd", 0)) + " / $" + str(opp.get("sell_usd", 0)) + "\n"
+        if "yes_price" in opp:
+            out += "YES Price : " + str(opp["yes_price"]) + "\n"
+        if "overround" in opp:
+            out += "Sum       : " + str(opp["sum"]) + "  Overround: " + opp.get("overround_pct","N/A") + "\n"
+        elif "spread" in opp:
+            out += "Spread    : " + str(opp["spread"]) + "  Midpoint: " + str(opp.get("midpoint","N/A")) + "\n"
+        else:
+            out += "Edge      : " + opp.get("edge_pct","N/A") + "\n"
+        out += "Prices    : " + str(price_list) + "\n"
+        if "hours_left" in opp and opp["hours_left"] is not None:
+            out += "Expires in: " + str(opp["hours_left"]) + "h\n"
+        if "common_keywords" in opp:
+            out += "Keywords  : " + str(opp["common_keywords"]) + "\n"
+        return out
+    except Exception as ex:
+        return "#{:02d} [fmt error: {}]\n".format(idx, str(ex))
 
 def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     urgent_n = sum(1 for o in push_opps if o.get("urgency") == "URGENT")
     watch_n  = sum(1 for o in push_opps if o.get("urgency") == "WATCH")
+    directional_n = sum(1 for o in push_opps if "Directional" in o.get("type",""))
+    whale_n       = sum(1 for o in push_opps if "Whale"       in o.get("type",""))
     msg = "<b>Polymarket ARB Scanner v9.0 - " + str(len(push_opps)) + " alerts</b>\n"
     msg += "Time: " + now_str + "\n"
     msg += "Markets scanned (&lt;=72h): " + str(total_markets) + "\n"
@@ -1425,6 +1430,18 @@ def build_tg_msg(push_opps, total_opps, total_markets, thresholds, filtered_n):
 # ----------------------------------------------------------------
 # Main scan
 # ----------------------------------------------------------------
+
+def sanitize_for_json(obj):
+    """Recursively remove non-JSON-serialisable floats (inf / nan)."""
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+    return obj
+
 def scan():
     log.info("=" * 60)
     log.info("Polymarket ARB Scanner v9.0 - weather longest-match fix")
@@ -1562,7 +1579,7 @@ def scan():
         "opportunities": opps,
     }
     with open("arb_report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+        json.dump(sanitize_for_json(report), f, ensure_ascii=False, indent=2)
     log.info("report saved -> " + str(len(opps)) + " total, " + str(pushed_n) + " pushed")
 
 
