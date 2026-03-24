@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ========================================================
-  main.py — WeatherArb Bot (Polymarket 天气套利机器人)
+  main.py — WeatherArb Bot (单次运行模式)
 ========================================================
 
 功能:
@@ -10,7 +10,7 @@
   2. 用 Open-Meteo 双模型集成预报 (best_match + ECMWF) 计算真实概率
   3. 贝叶斯正态CDF 对比市场隐含概率，识别 Edge >= 12% 的套利机会
   4. Quarter-Kelly 仓位建议，通过 Telegram 推送信号
-  5. 持续循环，每 300 秒扫描一次
+  5. 单次运行模式：跑完一轮立即退出，由 GitHub Actions cron 控制触发频率
 
 环境变量:
   TELEGRAM_BOT_TOKEN   — Telegram Bot Token
@@ -46,7 +46,6 @@ MIN_LIQUIDITY       = 500
 PAGE_SIZE           = 100
 MAX_PAGES           = 50
 REQUEST_DELAY       = 0.3
-SCAN_INTERVAL       = 300
 SCAN_WINDOW_HOURS   = 72
 WEATHER_EDGE_MIN    = 0.12
 MIN_EDGE            = 0.08
@@ -214,7 +213,8 @@ def retry_get(url, params=None, timeout=10, retries=3):
             return resp
         except Exception as ex:
             wait = 2 ** attempt
-            log.warning("retry_get attempt %d/%d failed (%s) -> wait %ds", attempt, retries, str(ex), wait)
+            log.warning("retry_get attempt %d/%d failed (%s) -> wait %ds",
+                        attempt, retries, str(ex), wait)
             time.sleep(wait)
     log.error("retry_get gave up: %s", url)
     return None
@@ -259,12 +259,12 @@ def hours_until_expiry(market):
 
 def get_urgency(hours_left):
     if hours_left is None:
-        return "WATCH", "🟡 WATCH"
+        return "WATCH", "\U0001f7e1 WATCH"
     if hours_left < 6:
-        return "URGENT", "🔴 URGENT"
+        return "URGENT", "\U0001f534 URGENT"
     if hours_left < 72:
-        return "WATCH", "🟡 WATCH"
-    return "EARLY", "🟢 EARLY"
+        return "WATCH", "\U0001f7e1 WATCH"
+    return "EARLY", "\U0001f7e2 EARLY"
 
 def sanitize_for_json(obj):
     """递归清理 nan/inf，替换为 None。"""
@@ -287,11 +287,11 @@ def fetch_weather_markets():
     for page in range(MAX_PAGES):
         log.info("fetching page %d (offset=%d)...", page + 1, offset)
         resp = retry_get(GAMMA_API + "/markets", params={
-            "limit":               PAGE_SIZE,
-            "offset":              offset,
-            "active":              "true",
-            "closed":              "false",
-            "liquidity_num_min":   MIN_LIQUIDITY,
+            "limit":             PAGE_SIZE,
+            "offset":            offset,
+            "active":            "true",
+            "closed":            "false",
+            "liquidity_num_min": MIN_LIQUIDITY,
         })
         if resp is None:
             break
@@ -392,7 +392,7 @@ class WeatherFetcher:
 
         lat, lon = coords
         model_results: Dict[str, float] = {}
-        for model, weight in self.MODEL_WEIGHTS.items():
+        for model in self.MODEL_WEIGHTS:
             result = self._fetch_model(lat, lon, model)
             if result and target_date in result:
                 model_results[model] = result[target_date]
@@ -403,14 +403,12 @@ class WeatherFetcher:
             log.error("all models failed for %s/%s", city_name, target_date)
             return None
 
-        # 归一化加权集成温度
         total_w = sum(self.MODEL_WEIGHTS[m] for m in model_results)
         ensemble_temp = sum(
             self.MODEL_WEIGHTS[m] * t / total_w
             for m, t in model_results.items()
         )
 
-        # 模型间标准差
         temps_list = list(model_results.values())
         if len(temps_list) > 1:
             mean_t = sum(temps_list) / len(temps_list)
@@ -439,14 +437,6 @@ class ProbabilityEngine:
 
     @staticmethod
     def calc_probability(forecast_temp, uncertainty_std, threshold, operator="above"):
-        """
-        计算概率:
-          above  -> P(T > threshold)
-          below  -> P(T < threshold)
-          between-> P(low < T < high), threshold=(low,high)
-
-        返回值限制在 [0.005, 0.995]。
-        """
         if operator == "above":
             p = 1.0 - norm.cdf(threshold, loc=forecast_temp, scale=uncertainty_std)
         elif operator == "below":
@@ -462,12 +452,6 @@ class ProbabilityEngine:
 
     @staticmethod
     def parse_market_title(title):
-        """
-        解析 Polymarket 市场标题，提取城市、日期、温度阈值、方向。
-
-        Returns:
-            dict(city, date, threshold, operator, unit, raw_temp) 或 None
-        """
         q_low = title.lower()
 
         # 1. 城市识别（最长匹配优先）
@@ -504,7 +488,7 @@ class ProbabilityEngine:
 
         # 3. 温度阈值 & 方向
         threshold_match = re.search(
-            r"(above|exceed|over|below|under)\s*(-?\d+(?:\.\d+)?)\s*(degrees|deg|°f|°c|f|c)?",
+            r"(above|exceed|over|below|under)\s*(-?\d+(?:\.\d+)?)\s*(degrees|deg|f|c)?",
             q_low
         )
         if not threshold_match:
@@ -525,10 +509,8 @@ class ProbabilityEngine:
         # 5. 方向映射
         if direction_word in ("above", "exceed", "over"):
             operator = "above"
-        elif direction_word in ("below", "under"):
-            operator = "below"
         else:
-            operator = "above"
+            operator = "below"
 
         return {
             "city":      matched_city,
@@ -543,16 +525,6 @@ class ProbabilityEngine:
 # Kelly 仓位计算
 # ----------------------------------------------------------------
 def calc_kelly(model_prob, yes_price, direction):
-    """
-    Quarter-Kelly 仓位计算，上限 15% 总资金。
-
-    Args:
-        model_prob: 模型计算的对应方向概率
-        yes_price:  市场 YES 价格
-        direction:  'BUY_YES' or 'BUY_NO'
-    Returns:
-        float: 建议仓位占总资金比例
-    """
     market_price = yes_price if direction == "BUY_YES" else (1.0 - yes_price)
     if market_price <= 0.01 or market_price >= 0.99:
         return 0.01
@@ -572,12 +544,6 @@ class WeatherArbDetector:
         self.prob_eng = ProbabilityEngine()
 
     def find_opportunities(self, markets):
-        """
-        对每个市场解析标题、获取气象预报、计算 Edge，返回机会列表。
-
-        Returns:
-            List[Dict]
-        """
         opps = []
         for market in markets:
             title = market.get("question") or market.get("title") or ""
@@ -615,7 +581,7 @@ class WeatherArbDetector:
                 continue
 
             direction  = "BUY_YES" if model_prob > yes_price else "BUY_NO"
-            confidence = "强倾向" if edge >= 0.15 else "中倾向"
+            confidence = "\u5f3a\u503e\u5411" if edge >= 0.15 else "\u4e2d\u503e\u5411"
             kelly_size = calc_kelly(model_prob, yes_price, direction)
 
             h = hours_until_expiry(market)
@@ -623,9 +589,9 @@ class WeatherArbDetector:
 
             forecast_f = WeatherFetcher.celsius_to_fahrenheit(ensemble_temp)
             thresh_display = (
-                "%.1f°%s (%.1f°C)" % (parsed["raw_temp"], parsed["unit"], threshold)
+                "%.1f\u00b0%s (%.1f\u00b0C)" % (parsed["raw_temp"], parsed["unit"], threshold)
                 if parsed["unit"] == "F"
-                else "%.1f°C" % threshold
+                else "%.1f\u00b0C" % threshold
             )
 
             opps.append({
@@ -656,25 +622,25 @@ class WeatherArbDetector:
                 "action":        direction,
             })
 
-        log.info("find_opportunities: %d markets scanned, %d opps found", len(markets), len(opps))
+        log.info("find_opportunities: %d markets scanned, %d opps found",
+                 len(markets), len(opps))
         return opps
 
 # ----------------------------------------------------------------
 # Output formatting
 # ----------------------------------------------------------------
 def fmt_opp(opp, idx):
-    """格式化单个机会为控制台可读字符串。"""
     try:
         models_str = "  ".join(
             "%s: %.1fC" % (k, v) for k, v in opp.get("model_temps", {}).items()
         )
-        dir_emoji = "🟢 BUY YES" if opp["direction"] == "BUY_YES" else "🔴 BUY NO"
+        dir_emoji = "\U0001f7e2 BUY YES" if opp["direction"] == "BUY_YES" else "\U0001f534 BUY NO"
         out  = "=" * 60 + "\n"
         out += "#%02d %s [%s]\n" % (idx, opp["type"], opp["confidence"])
         out += "Market    : %s\n" % opp["market"][:80]
         out += "URL       : %s\n" % opp.get("url", "N/A")
         out += "City      : %s  |  Date: %s\n" % (opp["city"], opp["date"])
-        out += "Forecast  : %.1f°C (%.1f°F) +/-%.1f°C\n" % (
+        out += "Forecast  : %.1f\u00b0C (%.1f\u00b0F) +/-%.1f\u00b0C\n" % (
             opp["ensemble_temp"], opp["ensemble_f"], opp["uncertainty"])
         out += "Condition : %s %s\n" % (opp["operator"].upper(), opp["threshold_disp"])
         out += "Model Prob: %.1f%%  |  Market: %.1f%%\n" % (
@@ -692,31 +658,30 @@ def fmt_opp(opp, idx):
 
 
 def build_tg_msg(opps, total_markets, scan_time):
-    """构建 Telegram HTML 推送消息。"""
-    strong_n = sum(1 for o in opps if o.get("confidence") == "强倾向")
-    medium_n = sum(1 for o in opps if o.get("confidence") == "中倾向")
+    strong_n = sum(1 for o in opps if o.get("confidence") == "\u5f3a\u503e\u5411")
+    medium_n = sum(1 for o in opps if o.get("confidence") == "\u4e2d\u503e\u5411")
 
-    msg  = "<b>WeatherArb Bot - %d 个信号</b>\n" % len(opps)
-    msg += "时间: %s\n" % scan_time
-    msg += "扫描市场数: %d\n" % total_markets
-    msg += "💪 强倾向: %d  |  📊 中倾向: %d\n\n" % (strong_n, medium_n)
+    msg  = "<b>WeatherArb Bot - %d \u4e2a\u4fe1\u53f7</b>\n" % len(opps)
+    msg += "\u65f6\u95f4: %s\n" % scan_time
+    msg += "\u626b\u63cf\u5e02\u573a\u6570: %d\n" % total_markets
+    msg += "\U0001f4aa \u5f3a\u503e\u5411: %d  |  \U0001f4ca \u4e2d\u503e\u5411: %d\n\n" % (strong_n, medium_n)
 
     for idx, opp in enumerate(opps[:8], 1):
-        dir_emoji = "🟢" if opp["direction"] == "BUY_YES" else "🔴"
+        dir_emoji = "\U0001f7e2" if opp["direction"] == "BUY_YES" else "\U0001f534"
         msg += "<b>#%d %s [%s]</b>\n" % (idx, opp["type"], opp["confidence"])
         msg += "%s\n" % opp["market"][:60]
-        msg += "模型: %.1f%%  市场: %.1f%%  Edge: %s\n" % (
+        msg += "\u6a21\u578b: %.1f%%  \u5e02\u573a: %.1f%%  Edge: %s\n" % (
             opp["model_prob"] * 100, opp["market_price"] * 100, opp["edge_pct"])
         msg += "%s %s  Kelly: %.1f%%\n" % (
             dir_emoji, opp["direction"], opp["kelly_size"] * 100)
-        msg += '<a href="%s">查看市场</a>\n\n' % opp.get("url", "#")
+        msg += '<a href="%s">\u67e5\u770b\u5e02\u573a</a>\n\n' % opp.get("url", "#")
 
     if len(opps) > 8:
-        msg += "<i>... 还有 %d 个信号，详见 arb_report.json</i>\n" % (len(opps) - 8)
+        msg += "<i>... \u8fd8\u6709 %d \u4e2a\u4fe1\u53f7\uff0c\u8be6\u89c1 arb_report.json</i>\n" % (len(opps) - 8)
     return msg
 
 # ----------------------------------------------------------------
-# Main scan
+# Main scan (单次运行)
 # ----------------------------------------------------------------
 def scan():
     log.info("=" * 60)
@@ -733,41 +698,37 @@ def scan():
         log.warning("No weather markets found in %dh window", SCAN_WINDOW_HOURS)
         send_telegram(
             "<b>WeatherArb Bot</b>\n"
-            "扫描完成，当前窗口内无天气市场。\n"
+            "\u5f53\u524d\u7a97\u53e3\u5185\u65e0\u5929\u6c14\u5e02\u573a\u3002\n"
             "%s" % datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         )
         return
 
     detector = WeatherArbDetector()
     opps     = detector.find_opportunities(markets)
-
-    # 按 edge 降序排序
     opps.sort(key=lambda o: -o.get("edge", 0))
 
-    # 控制台打印
     for idx, opp in enumerate(opps, 1):
         print(fmt_opp(opp, idx))
 
     scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    # Telegram 推送（只推送 edge >= WATCH_PUSH_MIN 的信号）
     push_opps = [o for o in opps if o["edge"] >= WATCH_PUSH_MIN]
+
     if push_opps:
         send_telegram(build_tg_msg(push_opps, len(markets), scan_time))
     else:
         send_telegram(
             "<b>WeatherArb Bot</b>\n"
-            "时间: %s\n"
-            "扫描市场: %d  |  识别信号: %d\n"
-            "当前无 Edge >= %.0f%% 的信号" % (
+            "\u65f6\u95f4: %s\n"
+            "\u626b\u63cf\u5e02\u573a: %d  |  \u8bc6\u522b\u4fe1\u53f7: %d\n"
+            "\u5f53\u524d\u65e0 Edge >= %.0f%% \u7684\u4fe1\u53f7" % (
                 scan_time, len(markets), len(opps), WATCH_PUSH_MIN * 100)
         )
 
     log.info("=" * 60)
-    log.info("DONE — %d markets | %d opps | %d pushed", len(markets), len(opps), len(push_opps))
+    log.info("DONE -- %d markets | %d opps | %d pushed",
+             len(markets), len(opps), len(push_opps))
     log.info("=" * 60)
 
-    # 保存 JSON 报告
     report = {
         "scan_time":     scan_time,
         "window_hours":  SCAN_WINDOW_HOURS,
@@ -781,28 +742,7 @@ def scan():
 
 
 # ----------------------------------------------------------------
-# Main loop
+# Entry point (单次运行，由 GitHub Actions cron 控制频率)
 # ----------------------------------------------------------------
 if __name__ == "__main__":
-    log.info("WeatherArb Bot 启动，扫描间隔 %ds", SCAN_INTERVAL)
-    send_telegram(
-        "<b>WeatherArb Bot 已启动</b>\n"
-        "间隔: %ds | MinEdge: %.0f%% | Window: %dh" % (
-            SCAN_INTERVAL, WEATHER_EDGE_MIN * 100, SCAN_WINDOW_HOURS)
-    )
-    while True:
-        try:
-            t0 = time.time()
-            scan()
-            elapsed = time.time() - t0
-            sleep_t = max(0, SCAN_INTERVAL - elapsed)
-            log.info("下次扫描在 %.0fs 后", sleep_t)
-            time.sleep(sleep_t)
-        except KeyboardInterrupt:
-            log.info("用户中断，退出")
-            send_telegram("⚠️ WeatherArb Bot 已停止")
-            break
-        except Exception as e:
-            log.exception("主循环异常: %s", str(e))
-            send_telegram("🚨 WeatherArb Bot 异常: " + str(e))
-            time.sleep(60)
+    scan()
